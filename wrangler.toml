@@ -1,0 +1,7 @@
+name = "notion-todoist-mcp"
+main = "worker.js"
+compatibility_date = "2024-11-01"
+
+# Secrets are set via CLI (not stored here):
+#   wrangler secret put NOTION_TOKEN
+#   wrangler secret put TODOIST_TOKEN

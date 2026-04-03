@@ -1,0 +1,1597 @@
+/**
+ * Notion + Todoist MCP Server for Cloudflare Workers
+ *
+ * Deploy:
+ *   wrangler secret put NOTION_TOKEN   ← Notion integration token
+ *   wrangler secret put TODOIST_TOKEN  ← Todoist API token
+ *   wrangler deploy
+ *
+ * Then register the Worker URL as a custom connector in Claude.ai.
+ */
+
+const MCP_VERSION = "2024-11-05";
+
+// ─────────────────────────────────────────────
+// Date expression evaluator (JST-aware)
+// Supported: "today", "yesterday", "tomorrow",
+//   "today+7d", "today-30d", "today+2w", "today+1m", "today+1y", "now"
+//   ISO date/datetime strings pass through as-is.
+// ─────────────────────────────────────────────
+function evalDate(expr) {
+  if (!expr || typeof expr !== "string") return expr;
+
+  // JST offset: UTC+9
+  const nowUTC = new Date();
+  const jstOffset = 9 * 60 * 60 * 1000;
+  const nowJST = new Date(nowUTC.getTime() + jstOffset);
+  const todayJST = new Date(
+    Date.UTC(nowJST.getUTCFullYear(), nowJST.getUTCMonth(), nowJST.getUTCDate())
+  );
+
+  const isoDate = (d) => d.toISOString().split("T")[0];
+
+  if (expr === "now")       return nowJST.toISOString().replace("Z", "+09:00");
+  if (expr === "today")     return isoDate(todayJST);
+  if (expr === "yesterday") { const d = new Date(todayJST); d.setUTCDate(d.getUTCDate() - 1); return isoDate(d); }
+  if (expr === "tomorrow")  { const d = new Date(todayJST); d.setUTCDate(d.getUTCDate() + 1); return isoDate(d); }
+
+  // today±N[dwmy]
+  const rel = expr.match(/^today([+-])(\d+)([dwmy])$/);
+  if (rel) {
+    const [, sign, num, unit] = rel;
+    const n = parseInt(num, 10) * (sign === "+" ? 1 : -1);
+    const d = new Date(todayJST);
+    if (unit === "d") d.setUTCDate(d.getUTCDate() + n);
+    if (unit === "w") d.setUTCDate(d.getUTCDate() + n * 7);
+    if (unit === "m") d.setUTCMonth(d.getUTCMonth() + n);
+    if (unit === "y") d.setUTCFullYear(d.getUTCFullYear() + n);
+    return isoDate(d);
+  }
+
+  return expr; // ISO date/datetime pass-through
+}
+
+// Recursively resolve date expressions inside a Notion filter object
+function resolveFilterDates(filter) {
+  if (!filter || typeof filter !== "object") return filter;
+  if (Array.isArray(filter)) return filter.map(resolveFilterDates);
+
+  const out = {};
+  for (const [k, v] of Object.entries(filter)) {
+    if (k === "date" && typeof v === "object" && v !== null) {
+      out[k] = {};
+      for (const [op, val] of Object.entries(v)) {
+        const dateOps = ["equals","before","after","on_or_before","on_or_after"];
+        out[k][op] = dateOps.includes(op) ? evalDate(val) : val;
+      }
+    } else if (typeof v === "object" && v !== null) {
+      out[k] = resolveFilterDates(v);
+    } else {
+      out[k] = v;
+    }
+  }
+  return out;
+}
+
+// ─────────────────────────────────────────────
+// Safe math evaluator
+// Recursive descent parser — no eval/new Function (CF Workers compatible)
+// Supports: +  -  *  /  %  ^  unary-  ()  Math.*  numeric literals
+// ─────────────────────────────────────────────
+function safeMath(expr) {
+  if (!expr || typeof expr !== "string") throw new Error("Expression required");
+
+  // ── Tokenizer ──────────────────────────────
+  const tokens = [];
+  let i = 0;
+  while (i < expr.length) {
+    const c = expr[i];
+    if (/\s/.test(c)) { i++; continue; }
+    if (/[0-9]/.test(c) || (c === "." && /[0-9]/.test(expr[i + 1] ?? ""))) {
+      let num = "";
+      while (i < expr.length && /[0-9.]/.test(expr[i])) num += expr[i++];
+      if ((num.match(/\./g) || []).length > 1) throw new Error(`Invalid number: ${num}`);
+      tokens.push({ t: "num", v: parseFloat(num) });
+    } else if (/[a-zA-Z_]/.test(c)) {
+      let id = "";
+      while (i < expr.length && /[a-zA-Z0-9_]/.test(expr[i])) id += expr[i++];
+      tokens.push({ t: "id", v: id });
+    } else if ("+-*/%(),.^".includes(c)) {
+      tokens.push({ t: "op", v: c });
+      i++;
+    } else {
+      throw new Error(`Unexpected character: ${c}`);
+    }
+  }
+  tokens.push({ t: "eof", v: "" });
+
+  // ── Supported Math.* ──────────────────────
+  const MATH_FN = {
+    round: Math.round, floor: Math.floor, ceil: Math.ceil,
+    sqrt: Math.sqrt, cbrt: Math.cbrt, abs: Math.abs,
+    exp: Math.exp, log: Math.log, log2: Math.log2, log10: Math.log10,
+    sin: Math.sin, cos: Math.cos, tan: Math.tan,
+    asin: Math.asin, acos: Math.acos, atan: Math.atan, atan2: Math.atan2,
+    sinh: Math.sinh, cosh: Math.cosh, tanh: Math.tanh,
+    pow: Math.pow, hypot: Math.hypot,
+    min: Math.min, max: Math.max,
+    trunc: Math.trunc, sign: Math.sign,
+  };
+  const MATH_CONST = {
+    PI: Math.PI, E: Math.E,
+    LN2: Math.LN2, LN10: Math.LN10,
+    LOG2E: Math.LOG2E, LOG10E: Math.LOG10E,
+    SQRT2: Math.SQRT2, SQRT1_2: Math.SQRT1_2,
+  };
+
+  // ── Parser ────────────────────────────────
+  let pos = 0;
+  const peek   = ()  => tokens[pos];
+  const consume = () => tokens[pos++];
+  const expectOp = (v) => {
+    if (peek().v !== v) throw new Error(`Expected '${v}', got '${peek().v || peek().t}'`);
+    return consume();
+  };
+
+  // expr  = term  (('+' | '-') term)*
+  function parseExpr() {
+    let v = parseTerm();
+    while (peek().v === "+" || peek().v === "-") {
+      const op = consume().v;
+      const r = parseTerm();
+      v = op === "+" ? v + r : v - r;
+    }
+    return v;
+  }
+
+  // term  = pow   (('*' | '/' | '%') pow)*
+  function parseTerm() {
+    let v = parsePow();
+    while (["*", "/", "%"].includes(peek().v)) {
+      const op = consume().v;
+      const r = parsePow();
+      v = op === "*" ? v * r : op === "/" ? v / r : v % r;
+    }
+    return v;
+  }
+
+  // pow   = unary ('^' unary)?   (right-associative)
+  function parsePow() {
+    const v = parseUnary();
+    if (peek().v === "^") { consume(); return Math.pow(v, parseUnary()); }
+    return v;
+  }
+
+  // unary = ('-' | '+') unary  |  atom
+  function parseUnary() {
+    if (peek().v === "-") { consume(); return -parseUnary(); }
+    if (peek().v === "+") { consume(); return parseUnary(); }
+    return parseAtom();
+  }
+
+  // atom  = NUMBER | '(' expr ')' | 'Math' '.' IDENT ('(' args ')')?
+  function parseAtom() {
+    const t = peek();
+    if (t.t === "num") { consume(); return t.v; }
+    if (t.v === "(") {
+      consume();
+      const v = parseExpr();
+      expectOp(")");
+      return v;
+    }
+    if (t.t === "id") {
+      if (t.v === "Math") {
+        consume();
+        expectOp(".");
+        const name = peek();
+        if (name.t !== "id") throw new Error(`Expected Math.* name after '.'`);
+        consume();
+        if (peek().v === "(") {
+          // Function call
+          if (!(name.v in MATH_FN)) throw new Error(`Unknown Math function: Math.${name.v}`);
+          consume(); // '('
+          const args = [];
+          if (peek().v !== ")") {
+            args.push(parseExpr());
+            while (peek().v === ",") { consume(); args.push(parseExpr()); }
+          }
+          expectOp(")");
+          return MATH_FN[name.v](...args);
+        } else {
+          // Constant
+          if (!(name.v in MATH_CONST)) throw new Error(`Unknown Math constant: Math.${name.v}`);
+          return MATH_CONST[name.v];
+        }
+      }
+      throw new Error(`Unknown identifier: ${t.v}`);
+    }
+    throw new Error(`Unexpected token: ${t.v || t.t}`);
+  }
+
+  let result;
+  try {
+    result = parseExpr();
+    if (peek().t !== "eof") throw new Error(`Unexpected token after expression: '${peek().v}'`);
+  } catch (e) {
+    throw new Error(`Math error: ${e.message}`);
+  }
+  if (typeof result !== "number" || !isFinite(result)) {
+    throw new Error("Result is not a finite number");
+  }
+  return result;
+}
+
+// ─────────────────────────────────────────────
+// Todoist compact & TSV helpers
+// ─────────────────────────────────────────────
+const TASK_COMPACT_DEFAULTS = ["id", "section", "co", "content", "labels", "due"];
+const TASK_FULL_MAP = {
+  id: "id", section: "(resolved)", sid: "section_id", co: "child_order",
+  content: "content", labels: "labels", due: "due", pid: "parent_id",
+  pri: "priority", desc: "description", proj: "project_id", rec: "due",
+};
+
+function compactTask(t, fields, sectionMap) {
+  const f = fields || TASK_COMPACT_DEFAULTS;
+  const o = {};
+  for (const k of f) {
+    switch (k) {
+      case "id":      o.id = t.id; break;
+      case "section": o.section = sectionMap?.[t.section_id] ?? t.section_id ?? ""; break;
+      case "sid":     o.sid = t.section_id ?? ""; break;
+      case "co":      o.co = t.child_order ?? 0; break;
+      case "content": o.content = t.content ?? ""; break;
+      case "labels":  o.labels = t.labels ?? []; break;
+      case "due":     o.due = t.due?.date ?? ""; break;
+      case "pid":     o.pid = t.parent_id ?? ""; break;
+      case "pri":     o.pri = (t.priority ?? 1) > 1 ? t.priority : ""; break;
+      case "desc":    o.desc = t.description ?? ""; break;
+      case "proj":    o.proj = t.project_id ?? ""; break;
+      case "rec":     o.rec = t.due?.is_recurring ? "y" : ""; break;
+      case "cat":     o.cat = t.completed_at ?? ""; break;
+    }
+  }
+  return o;
+}
+
+// Build section_id → name map from Todoist sections API
+async function buildSectionMap(token, projectId) {
+  const raw = await todoistReq(token, "GET", `/sections?project_id=${projectId}`);
+  const sections = Array.isArray(raw) ? raw : (raw?.results ?? []);
+  const map = {};
+  for (const s of sections) map[s.id] = s.name;
+  return { map, sections };
+}
+
+function compactSection(s) {
+  return { id: s.id, name: s.name, order: s.section_order ?? s.order ?? 0 };
+}
+
+function compactProject(p) {
+  return { id: p.id, name: p.name };
+}
+
+function toTSV(rows) {
+  if (!rows.length) return "";
+  const keys = Object.keys(rows[0]);
+  const escape = (v) => {
+    if (v === null || v === undefined) return "";
+    if (Array.isArray(v)) return v.join(",");
+    const s = String(v);
+    // If value contains tab or newline, quote it (replace internal newlines with ␊)
+    if (s.includes("\t") || s.includes("\n") || s.includes("\r"))
+      return s.replace(/[\r\n]+/g, "␊");
+    return s;
+  };
+  const header = keys.join("\t");
+  const lines = rows.map(r => keys.map(k => escape(r[k])).join("\t"));
+  return header + "\n" + lines.join("\n");
+}
+
+// Apply compact + format to a Todoist list result
+function formatTodoistList(items, compactFn, args) {
+  const compact = args.compact !== false; // default true
+  const rows = compact ? items.map(i => compactFn(i)) : items;
+  if (args.format === "json") return { results: rows, count: rows.length };
+  return toTSV(rows); // default: tsv
+}
+
+// ─────────────────────────────────────────────
+// Notion API helper  (429対応: Retry-After尊重 + 指数バックオフ)
+// ─────────────────────────────────────────────
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+async function notionReq(token, method, path, body, _attempt = 0) {
+  const res = await fetch(`https://api.notion.com/v1${path}`, {
+    method,
+    headers: {
+      Authorization: `Bearer ${token}`,
+      "Notion-Version": "2022-06-28",
+      "Content-Type": "application/json",
+    },
+    body: body ? JSON.stringify(body) : undefined,
+  });
+
+  // Rate limited — wait and retry (max 4 attempts)
+  if (res.status === 429 && _attempt < 4) {
+    const retryAfter = parseInt(res.headers.get("Retry-After") || "1", 10);
+    const waitMs = Math.max(retryAfter * 1000, 400 * Math.pow(2, _attempt));
+    await sleep(waitMs);
+    return notionReq(token, method, path, body, _attempt + 1);
+  }
+
+  if (!res.ok) {
+    const e = await res.json().catch(() => ({}));
+    throw new Error(`Notion ${res.status}: ${e.message || res.statusText}`);
+  }
+  return res.json();
+}
+
+// Strip collection:// prefix if present
+function normalizeId(id) {
+  return id?.replace(/^collection:\/\//, "").replace(/-/g, "").replace(
+    /^(.{8})(.{4})(.{4})(.{4})(.{12})$/, "$1-$2-$3-$4-$5"
+  ) ?? id;
+}
+
+// Extract numeric value from any Notion property
+function extractNum(prop) {
+  if (!prop) return null;
+  if (prop.type === "number") return prop.number;
+  if (prop.type === "formula") return prop.formula?.number ?? null;
+  if (prop.type === "rollup") {
+    if (prop.rollup?.type === "number") return prop.rollup.number;
+    if (prop.rollup?.type === "array") {
+      const nums = (prop.rollup.array || []).map(extractNum).filter(n => n !== null);
+      return nums.length ? nums.reduce((a, b) => a + b, 0) : null;
+    }
+  }
+  return null;
+}
+
+
+// Compact property extractor: Notion property JSON → simple value (token saver)
+function compactProps(properties) {
+  const out = {};
+  for (const [k, v] of Object.entries(properties)) {
+    switch (v.type) {
+      case "title":
+      case "rich_text": out[k] = v[v.type].map(t => t.plain_text).join(""); break;
+      case "number":    out[k] = v.number; break;
+      case "select":    out[k] = v.select?.name ?? null; break;
+      case "multi_select": out[k] = v.multi_select.map(o => o.name); break;
+      case "status":    out[k] = v.status?.name ?? null; break;
+      case "date":      out[k] = v.date ? (v.date.end ? `${v.date.start}~${v.date.end}` : v.date.start) : null; break;
+      case "checkbox":  out[k] = v.checkbox; break;
+      case "url":       out[k] = v.url; break;
+      case "email":     out[k] = v.email; break;
+      case "phone_number": out[k] = v.phone_number; break;
+      case "formula":   out[k] = v.formula?.string ?? v.formula?.number ?? v.formula?.boolean ?? null; break;
+      case "relation":  out[k] = v.relation.map(r => r.id); break;
+      case "rollup":    out[k] = v.rollup?.number ?? v.rollup?.array?.map(i => compactProps({v: i}).v) ?? null; break;
+      case "created_time": out[k] = v.created_time; break;
+      case "last_edited_time": out[k] = v.last_edited_time; break;
+      default: out[k] = null;
+    }
+  }
+  return out;
+}
+
+
+// ─────────────────────────────────────────────
+// Markdown → Notion blocks converter
+// Supports: h1-h3, bullet, numbered, quote,
+//   divider, code fence, paragraph
+//   Inline: **bold**, *italic*, `code`
+// ─────────────────────────────────────────────
+function mkRichText(line) {
+  const parts = [];
+  // tokenize inline: **bold**, *italic*, `code`
+  const re = /(\*\*(.+?)\*\*|\*(.+?)\*|`([^`]+)`)/g;
+  let last = 0, m;
+  while ((m = re.exec(line)) !== null) {
+    if (m.index > last) parts.push({ type: "text", text: { content: line.slice(last, m.index) } });
+    if (m[2] !== undefined) parts.push({ type: "text", text: { content: m[2] }, annotations: { bold: true } });
+    else if (m[3] !== undefined) parts.push({ type: "text", text: { content: m[3] }, annotations: { italic: true } });
+    else if (m[4] !== undefined) parts.push({ type: "text", text: { content: m[4] }, annotations: { code: true } });
+    last = m.index + m[0].length;
+  }
+  if (last < line.length) parts.push({ type: "text", text: { content: line.slice(last) } });
+  return parts.length ? parts : [{ type: "text", text: { content: line } }];
+}
+
+function mdToBlocks(md) {
+  if (!md) return [];
+  const lines = md.split("\n");
+  const blocks = [];
+  let i = 0;
+  while (i < lines.length) {
+    const line = lines[i];
+    // code fence
+    if (line.startsWith("```")) {
+      const lang = line.slice(3).trim() || "plain text";
+      const codeLines = [];
+      i++;
+      while (i < lines.length && !lines[i].startsWith("```")) { codeLines.push(lines[i]); i++; }
+      blocks.push({ object: "block", type: "code",
+        code: { rich_text: [{ type: "text", text: { content: codeLines.join("\n") } }], language: lang } });
+      i++; continue;
+    }
+    // headings
+    if (line.startsWith("### ")) { blocks.push({ object: "block", type: "heading_3", heading_3: { rich_text: mkRichText(line.slice(4)) } }); i++; continue; }
+    if (line.startsWith("## "))  { blocks.push({ object: "block", type: "heading_2", heading_2: { rich_text: mkRichText(line.slice(3)) } }); i++; continue; }
+    if (line.startsWith("# "))   { blocks.push({ object: "block", type: "heading_1", heading_1: { rich_text: mkRichText(line.slice(2)) } }); i++; continue; }
+    // quote
+    if (line.startsWith("> "))   { blocks.push({ object: "block", type: "quote",     quote:     { rich_text: mkRichText(line.slice(2)) } }); i++; continue; }
+    // divider
+    if (/^---+$/.test(line.trim())) { blocks.push({ object: "block", type: "divider", divider: {} }); i++; continue; }
+    // bullet list
+    if (/^[-*+] /.test(line))    { blocks.push({ object: "block", type: "bulleted_list_item", bulleted_list_item: { rich_text: mkRichText(line.slice(2)) } }); i++; continue; }
+    // numbered list
+    if (/^\d+\. /.test(line))    { blocks.push({ object: "block", type: "numbered_list_item", numbered_list_item: { rich_text: mkRichText(line.replace(/^\d+\. /, "")) } }); i++; continue; }
+    // blank line → skip
+    if (line.trim() === "")      { i++; continue; }
+    // paragraph
+    blocks.push({ object: "block", type: "paragraph", paragraph: { rich_text: mkRichText(line) } });
+    i++;
+  }
+  return blocks;
+}
+
+// Resolve date values in a properties map before sending to Notion
+function resolvePropDates(properties) {
+  if (!properties) return properties;
+  const out = {};
+  for (const [k, v] of Object.entries(properties)) {
+    if (v?.date?.start) {
+      out[k] = { date: { ...v.date, start: evalDate(v.date.start), end: v.date.end ? evalDate(v.date.end) : undefined } };
+    } else {
+      out[k] = v;
+    }
+  }
+  return out;
+}
+
+// ─────────────────────────────────────────────
+// Property shorthand normalizer
+// Converts simple values into Notion API property format:
+//   "text"           → rich_text
+//   123              → number
+//   true/false       → checkbox
+//   ["a","b"]        → multi_select
+//   {title:"text"}   → title
+//   {select:"name"}  → select
+//   {date:"expr"}    → date  (evalDate applied)
+//   {multi_select:["a"]} → multi_select
+//   Already-formatted Notion objects pass through unchanged.
+// ─────────────────────────────────────────────
+function normalizeProperties(properties) {
+  if (!properties) return properties;
+  const NOTION_KEYS = new Set([
+    "rich_text","title","number","select","multi_select",
+    "date","checkbox","url","email","phone_number","status",
+    "relation","people","files",
+  ]);
+  const out = {};
+  for (const [key, val] of Object.entries(properties)) {
+    if (val === null || val === undefined) { out[key] = val; continue; }
+
+    // Object — check if already Notion format or a shorthand wrapper
+    if (typeof val === "object" && !Array.isArray(val)) {
+      const vKeys = Object.keys(val);
+      if (vKeys.some(k => NOTION_KEYS.has(k))) {
+        // Shorthand wrappers inside Notion-keyed objects
+        if (val.title   && typeof val.title === "string")
+          { out[key] = { title: [{ text: { content: val.title } }] }; continue; }
+        if (val.select  && typeof val.select === "string")
+          { out[key] = { select: { name: val.select } }; continue; }
+        if (val.multi_select && Array.isArray(val.multi_select) && typeof val.multi_select[0] === "string")
+          { out[key] = { multi_select: val.multi_select.map(n => ({ name: n })) }; continue; }
+        if (val.date    && typeof val.date === "string")
+          { out[key] = { date: { start: evalDate(val.date) } }; continue; }
+        // Already full Notion format — pass through
+        out[key] = val; continue;
+      }
+    }
+
+    // Plain string → rich_text
+    if (typeof val === "string")  { out[key] = { rich_text: [{ text: { content: val } }] }; continue; }
+    // Number → number
+    if (typeof val === "number")  { out[key] = { number: val }; continue; }
+    // Boolean → checkbox
+    if (typeof val === "boolean") { out[key] = { checkbox: val }; continue; }
+    // Array of strings → multi_select
+    if (Array.isArray(val) && val.length && val.every(v => typeof v === "string"))
+      { out[key] = { multi_select: val.map(n => ({ name: n })) }; continue; }
+
+    // Fallback — pass through
+    out[key] = val;
+  }
+  return out;
+}
+
+// ─────────────────────────────────────────────
+// Todoist API helper  (429対応: Retry-After尊重 + 指数バックオフ)
+// ─────────────────────────────────────────────
+async function todoistReq(token, method, path, body, _attempt = 0) {
+  const res = await fetch(`https://api.todoist.com/api/v1${path}`, {
+    method,
+    headers: {
+      Authorization: `Bearer ${token}`,
+      "Content-Type": "application/json",
+    },
+    body: body ? JSON.stringify(body) : undefined,
+  });
+
+  // Rate limited — wait and retry (max 4 attempts)
+  if (res.status === 429 && _attempt < 4) {
+    const retryAfter = parseInt(res.headers.get("Retry-After") || "1", 10);
+    const waitMs = Math.max(retryAfter * 1000, 400 * Math.pow(2, _attempt));
+    await sleep(waitMs);
+    return todoistReq(token, method, path, body, _attempt + 1);
+  }
+
+  // Server error — wait 500ms and retry once.
+  // Write ops (POST/DELETE) are idempotent by task_id for update/close/delete/reopen.
+  // For create, caller handles dedup (see t_create_task / t_bulk).
+  if (res.status >= 500 && _attempt < 1) {
+    await sleep(500);
+    return todoistReq(token, method, path, body, _attempt + 1);
+  }
+
+  if (!res.ok) {
+    const text = await res.text().catch(() => "");
+    throw new Error(`Todoist ${res.status}: ${text || res.statusText}`);
+  }
+  if (res.status === 204) return null;
+  return res.json();
+}
+
+// ─────────────────────────────────────────────
+// Tool definitions  (ordered by usage frequency)
+// ─────────────────────────────────────────────
+const TOOLS = [
+  // ── Todoist: high-frequency ───────────────
+  {
+    name: "t_get_tasks",
+    description:
+      "Get Todoist tasks. Filter by section (name), section_id, project_id, label, filter, or ids[]. " +
+      "section: resolve by name (e.g. 'ワクチン接種') — requires project_id. " +
+      "compact (default true) returns id/section/co/content/labels/due. " +
+      "Default format: tsv. fields: id,section,sid,co,content,labels,due,pid,pri,desc,proj,rec,cat.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        project_id: { type: "string" },
+        section: { type: "string", description: "Section name (resolved to section_id by Worker)" },
+        section_id: { type: "string" },
+        label: { type: "string" },
+        filter: { type: "string", description: "Todoist filter e.g. '@next & #Inbox'" },
+        ids: { type: "array", items: { type: "string" } },
+        limit: { type: "number", description: "Max tasks to return (default: all)" },
+        compact: { type: "boolean", default: true },
+        format: { type: "string", enum: ["json", "tsv"], description: "Default: tsv" },
+        fields: { type: "array", items: { type: "string" }, description: "Override compact field list" },
+      },
+    },
+  },
+  {
+    name: "t_update_task",
+    description: "Update a Todoist task. due_date supports date expressions (today, today+7d, etc.).",
+    inputSchema: {
+      type: "object",
+      properties: {
+        task_id: { type: "string" },
+        content: { type: "string" },
+        labels: { type: "array", items: { type: "string" } },
+        due_date: { type: "string", description: "Date expression or ISO date" },
+        due_string: { type: "string" },
+        priority: { type: "number", description: "1=normal, 2=medium, 3=high, 4=urgent" },
+        description: { type: "string" },
+        section_id: { type: "string" },
+        project_id: { type: "string", description: "Move task to another project" },
+        parent_id: { type: "string", description: "Parent task ID (set to make subtask, 'none' to promote to top-level)" },
+      },
+      required: ["task_id"],
+    },
+  },
+  {
+    name: "t_close_task",
+    description: "Mark a Todoist task as completed.",
+    inputSchema: {
+      type: "object",
+      properties: { task_id: { type: "string" } },
+      required: ["task_id"],
+    },
+  },
+  {
+    name: "t_create_task",
+    description: "Create a Todoist task. due_date supports date expressions (today, today+7d, etc.).",
+    inputSchema: {
+      type: "object",
+      properties: {
+        content: { type: "string" },
+        project_id: { type: "string" },
+        section_id: { type: "string" },
+        parent_id: { type: "string", description: "Parent task ID to create as subtask" },
+        labels: { type: "array", items: { type: "string" } },
+        due_date: { type: "string", description: "Date expression or ISO date" },
+        due_string: { type: "string" },
+        priority: { type: "number", description: "1=normal, 2=medium, 3=high, 4=urgent" },
+        description: { type: "string" },
+        order: { type: "number" },
+      },
+      required: ["content"],
+    },
+  },
+  {
+    name: "t_delete_task",
+    description: "Delete a Todoist task permanently.",
+    inputSchema: {
+      type: "object",
+      properties: { task_id: { type: "string" } },
+      required: ["task_id"],
+    },
+  },
+  {
+    name: "t_bulk",
+    description:
+      "Execute multiple Todoist operations in one call. " +
+      "Actions: update (task_id + fields), close (task_id), delete (task_id), " +
+      "create (content + fields). Runs in parallel (max 3 concurrent). " +
+      "Use for /review label fixes, batch closes, or sequential task renumbering.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        operations: {
+          type: "array",
+          description: "Array of operations to execute",
+          items: {
+            type: "object",
+            properties: {
+              action: { type: "string", enum: ["update", "close", "delete", "create"] },
+              task_id: { type: "string", description: "Required for update/close/delete" },
+              content: { type: "string" },
+              labels: { type: "array", items: { type: "string" } },
+              due_date: { type: "string", description: "Date expression or ISO date" },
+              due_string: { type: "string" },
+              priority: { type: "number" },
+              description: { type: "string" },
+              section_id: { type: "string" },
+              project_id: { type: "string" },
+              parent_id: { type: "string", description: "Parent task ID for subtask" },
+              order: { type: "number" },
+            },
+            required: ["action"],
+          },
+        },
+      },
+      required: ["operations"],
+    },
+  },
+  {
+    name: "t_get_sections",
+    description: "Get sections of a Todoist project. compact:true (default) returns id/name/order only.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        project_id: { type: "string" },
+        compact: { type: "boolean", default: true },
+        format: { type: "string", enum: ["json", "tsv"] },
+      },
+      required: ["project_id"],
+    },
+  },
+  {
+    name: "t_get_projects",
+    description: "List all Todoist projects. compact:true (default) returns id/name only.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        compact: { type: "boolean", default: true },
+        format: { type: "string", enum: ["json", "tsv"] },
+      },
+    },
+  },
+
+  // ── Notion: high-frequency ────────────────
+  {
+    name: "n_query",
+    description:
+      "Query a Notion database. Accepts collection:// IDs. compact:true (default) compresses output. fetch_all:true auto-paginates (max 500). " +
+      "Date expressions supported in filters: today, today+7d, today-30d, etc. " +
+      "Optional aggregate: {count, sum, avg, min, max} by property name.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        database_id: { type: "string" },
+        filter: { type: "object" },
+        sorts: { type: "array" },
+        page_size: { type: "number", default: 20 },
+        start_cursor: { type: "string" },
+        compact: { type: "boolean", default: true },
+        fetch_all: { type: "boolean" },
+        aggregate: {
+          type: "object",
+          properties: {
+            count: { type: "boolean" },
+            sum:   { type: "string", description: "Property name to sum" },
+            avg:   { type: "string", description: "Property name to average" },
+            min:   { type: "string", description: "Property name for minimum" },
+            max:   { type: "string", description: "Property name for maximum" },
+            first: { type: "string", description: "Property name: value of first result" },
+            last:  { type: "string", description: "Property name: value of last result" },
+            delta: { type: "string", description: "Property name: last minus first" },
+            only_agg: { type: "boolean", description: "Return aggregations only, omit results (saves tokens)" },
+          },
+        },
+      },
+      required: ["database_id"],
+    },
+  },
+  {
+    name: "n_create_page",
+    description:
+      "Create a page in a Notion database. Date values support expressions. " +
+      "content: Markdown (# h1, - bullet, **bold**, ```code```, etc.) " +
+      "Property shorthand: string→rich_text, number→number, bool→checkbox, " +
+      "[\"a\",\"b\"]→multi_select, {title:\"s\"}, {select:\"s\"}, {date:\"expr\"}, {multi_select:[\"a\"]}.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        database_id: { type: "string" },
+        properties: { type: "object" },
+        content: { type: "string", description: "Optional Markdown body" },
+      },
+      required: ["database_id", "properties"],
+    },
+  },
+  {
+    name: "n_update_page",
+    description:
+      "Update properties or body content of a Notion page. " +
+      "archived:true to trash. " +
+      "replace_content: Markdown string to replace the entire page body. " +
+      "append_content: Markdown string to append blocks at the end of the page. " +
+      "Property shorthand: string→rich_text, number→number, bool→checkbox, " +
+      "[\"a\",\"b\"]→multi_select, {title:\"s\"}, {select:\"s\"}, {date:\"expr\"}, {multi_select:[\"a\"]}.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        page_id: { type: "string" },
+        properties: { type: "object" },
+        archived: { type: "boolean" },
+        replace_content: { type: "string", description: "Markdown — replaces all existing blocks" },
+        append_content: { type: "string", description: "Markdown — appends blocks after existing content" },
+      },
+      required: ["page_id"],
+    },
+  },
+
+  // ── Utility ───────────────────────────────
+  {
+    name: "eval_date",
+    description: "Resolve a JST date expression to ISO date. Supports: today, yesterday, tomorrow, today+7d, today-30d, today+2w, today+1m, now.",
+    inputSchema: {
+      type: "object",
+      properties: { expression: { type: "string" } },
+      required: ["expression"],
+    },
+  },
+  {
+    name: "calculate",
+    description: "Evaluate a math expression. Supports Math.*. e.g. \"1400*1.2\", \"Math.round(56.4*0.185)\".",
+    inputSchema: {
+      type: "object",
+      properties: { expression: { type: "string" } },
+      required: ["expression"],
+    },
+  },
+  {
+    name: "stats",
+    description: "Compute statistics from a number array: count, sum, avg, min, max, first, last, delta (last−first), median. Pass round to round all results. Use after n_query to analyze extracted values.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        values: { type: "array", items: { type: "number" }, description: "Array of numbers" },
+        round: { type: "number", description: "Decimal places to round (optional)" },
+      },
+      required: ["values"],
+    },
+  },
+
+  // ── Notion: lower-frequency ───────────────
+  {
+    name: "n_get_page",
+    description: "Get a Notion page by ID (all properties).",
+    inputSchema: {
+      type: "object",
+      properties: { page_id: { type: "string" } },
+      required: ["page_id"],
+    },
+  },
+  {
+    name: "n_get_blocks",
+    description: "Get page body as plain text blocks. Use when you need page content, not just properties.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        page_id: { type: "string" },
+        page_size: { type: "number", default: 100 },
+      },
+      required: ["page_id"],
+    },
+  },
+  {
+    name: "n_get_schema",
+    description: "Get property schema of a Notion database. Accepts collection:// IDs.",
+    inputSchema: {
+      type: "object",
+      properties: { database_id: { type: "string" } },
+      required: ["database_id"],
+    },
+  },
+  {
+    name: "n_search",
+    description: "Search Notion workspace by title.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        query: { type: "string" },
+        type: { type: "string", enum: ["page", "database"] },
+        page_size: { type: "number", default: 10 },
+      },
+      required: ["query"],
+    },
+  },
+
+  // ── Todoist: lower-frequency ──────────────
+  {
+    name: "t_get_task",
+    description: "Get a single Todoist task by ID. compact:true (default) strips to essential fields.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        task_id: { type: "string" },
+        compact: { type: "boolean", default: true },
+        fields: { type: "array", items: { type: "string" } },
+      },
+      required: ["task_id"],
+    },
+  },
+  {
+    name: "t_reopen_task",
+    description: "Reopen a completed Todoist task.",
+    inputSchema: {
+      type: "object",
+      properties: { task_id: { type: "string" } },
+      required: ["task_id"],
+    },
+  },
+  {
+    name: "t_get_completed_tasks",
+    description:
+      "Get completed Todoist tasks. Defaults to the last 7 days. " +
+      "section_id / project_id are filtered Worker-side (not by Todoist API). " +
+      "Use for /review step 3: checking which #1 tasks finished so next can be promoted. " +
+      "compact:true (default) strips fields. format:'tsv' for token savings.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        project_id: { type: "string", description: "Filter by project (Worker-side)" },
+        section_id: { type: "string", description: "Filter by section (Worker-side)" },
+        since: { type: "string", description: "Start date YYYY-MM-DD (inclusive)" },
+        until: { type: "string", description: "End date YYYY-MM-DD (inclusive)" },
+        limit: { type: "number", description: "Max tasks (default 50, max 200)" },
+        compact: { type: "boolean", default: true },
+        format: { type: "string", enum: ["json", "tsv"] },
+        fields: { type: "array", items: { type: "string" }, description: "Field list (adds 'cat' for completed_at by default)" },
+      },
+    },
+  },
+  {
+    name: "t_get_labels",
+    description: "List all personal labels in Todoist.",
+    inputSchema: { type: "object", properties: {} },
+  },
+  {
+    name: "t_create_section",
+    description: "Create a new section in a Todoist project.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        name: { type: "string" },
+        project_id: { type: "string" },
+        order: { type: "number" },
+      },
+      required: ["name", "project_id"],
+    },
+  },
+  {
+    name: "t_update_section",
+    description: "Rename a Todoist section.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        section_id: { type: "string" },
+        name: { type: "string" },
+      },
+      required: ["section_id", "name"],
+    },
+  },
+  {
+    name: "t_delete_section",
+    description: "Delete a Todoist section (and all tasks within it).",
+    inputSchema: {
+      type: "object",
+      properties: { section_id: { type: "string" } },
+      required: ["section_id"],
+    },
+  },
+
+  // ── Notion: rarely needed ─────────────────
+  {
+    name: "n_create_database",
+    description:
+      "Create a new Notion database under a parent page. " +
+      "properties must include a title-type property. " +
+      "e.g. {\"Name\":{\"title\":{}},\"Date\":{\"date\":{}},\"Value\":{\"number\":{}}}",
+    inputSchema: {
+      type: "object",
+      properties: {
+        parent_page_id: { type: "string" },
+        title: { type: "string" },
+        properties: { type: "object", description: "Notion property schema" },
+        icon: { type: "string", description: "Emoji e.g. 📊" },
+      },
+      required: ["parent_page_id", "title", "properties"],
+    },
+  },
+  {
+    name: "n_update_schema",
+    description: "Add/remove columns or rename a Notion database. add: {col: schema}, remove: [colNames].",
+    inputSchema: {
+      type: "object",
+      properties: {
+        database_id: { type: "string" },
+        add: { type: "object" },
+        remove: { type: "array", items: { type: "string" } },
+        title: { type: "string", description: "Rename the database" },
+      },
+      required: ["database_id"],
+    },
+  },
+
+  // ── Todoist: project management ───────────
+  {
+    name: "t_create_project",
+    description: "Create a new Todoist project.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        name: { type: "string" },
+        color: { type: "string" },
+        is_favorite: { type: "boolean" },
+      },
+      required: ["name"],
+    },
+  },
+  {
+    name: "t_update_project",
+    description: "Update a Todoist project.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        project_id: { type: "string" },
+        name: { type: "string" },
+        color: { type: "string" },
+        is_favorite: { type: "boolean" },
+      },
+      required: ["project_id"],
+    },
+  },
+  {
+    name: "t_delete_project",
+    description: "Delete a Todoist project permanently.",
+    inputSchema: {
+      type: "object",
+      properties: { project_id: { type: "string" } },
+      required: ["project_id"],
+    },
+  },
+
+  // ── Meta ──────────────────────────────────
+  {
+    name: "help",
+    description:
+      "Returns full tool list: all tool names and inputSchemas. Also returns static config: Notion DB IDs (state, metrics, events, food_master) and Todoist inbox project ID and section IDs.",
+    inputSchema: { type: "object", properties: {} },
+  },
+];
+
+// ─────────────────────────────────────────────
+// Tool handlers
+// ─────────────────────────────────────────────
+async function runTool(env, name, args) {
+  const nt = env.NOTION_TOKEN;
+  const tt = env.TODOIST_TOKEN;
+
+  switch (name) {
+    // ── Utility ──
+    case "eval_date":
+      return { expression: args.expression, resolved: evalDate(args.expression) };
+
+    case "calculate": {
+      const result = safeMath(args.expression);
+      return { expression: args.expression, result };
+    }
+
+    case "stats": {
+      const nums = (args.values || []).filter(n => typeof n === "number" && !isNaN(n));
+      if (!nums.length) return { error: "No valid numbers provided" };
+      const sorted = [...nums].sort((a, b) => a - b);
+      const sum = nums.reduce((a, b) => a + b, 0);
+      const avg = sum / nums.length;
+      const mid = Math.floor(sorted.length / 2);
+      const median = sorted.length % 2 === 0
+        ? (sorted[mid - 1] + sorted[mid]) / 2
+        : sorted[mid];
+      const r = args.round ?? null;
+      const fmt = (n) => r !== null ? Math.round(n * 10 ** r) / 10 ** r : n;
+      return {
+        count: nums.length,
+        sum: fmt(sum),
+        avg: fmt(avg),
+        min: sorted[0],
+        max: sorted[sorted.length - 1],
+        first: nums[0],
+        last: nums[nums.length - 1],
+        delta: fmt(nums[nums.length - 1] - nums[0]),
+        median: fmt(median),
+      };
+    }
+
+    // ── Notion ──
+    case "n_get_schema": {
+      const id = normalizeId(args.database_id);
+      const db = await notionReq(nt, "GET", `/databases/${id}`);
+      const schema = {};
+      for (const [pname, prop] of Object.entries(db.properties)) {
+        schema[pname] = { type: prop.type };
+        if (prop.select)       schema[pname].options = prop.select.options.map(o => o.name);
+        if (prop.multi_select) schema[pname].options = prop.multi_select.options.map(o => o.name);
+        if (prop.status)       schema[pname].options = prop.status.options?.map(o => o.name);
+        if (prop.relation)     schema[pname].database_id = prop.relation.database_id;
+        if (prop.number)       schema[pname].format = prop.number.format;
+      }
+      return { title: db.title?.[0]?.plain_text, database_id: id, properties: schema };
+    }
+
+    case "n_query": {
+      const id = normalizeId(args.database_id);
+      const body = { page_size: args.page_size ?? 20 };
+      if (args.filter) body.filter = resolveFilterDates(args.filter);
+      if (args.sorts)  body.sorts = args.sorts;
+
+      // 自動ページネーション (fetch_all:true 指定時)
+      // 3req/s制限対応: ページ切り替え間に350msウェイト
+      const allPages = [];
+      let cursor = args.start_cursor ?? null;
+      let remaining = true;
+      let fetchCount = 0;
+
+      while (remaining) {
+        if (cursor) body.start_cursor = cursor;
+        else delete body.start_cursor;
+
+        if (fetchCount > 0) await sleep(350);
+        const res = await notionReq(nt, "POST", `/databases/${id}/query`, body);
+        fetchCount++;
+
+        for (const p of res.results) {
+          allPages.push({
+            id: p.id, url: p.url,
+            created_time: p.created_time,
+            last_edited_time: p.last_edited_time,
+            properties: args.compact !== false ? compactProps(p.properties) : p.properties,
+          });
+        }
+
+        cursor = res.next_cursor;
+        // fetch_all=true かつ続きがある場合のみ継続（安全上限: 500件 or 5ページ）
+        remaining = args.fetch_all === true && res.has_more
+          && allPages.length < 500 && fetchCount < 5;
+      }
+
+      const pages = allPages;
+      const out = {
+        result_count: pages.length,
+        fetched_pages: fetchCount,
+        has_more: cursor != null,
+        next_cursor: cursor,
+        results: pages,
+      };
+
+      if (args.aggregate) {
+        const agg = args.aggregate;
+        out.aggregations = {};
+        if (agg.count) out.aggregations.count = pages.length;
+        for (const op of ["sum", "avg", "min", "max", "first", "last", "delta"]) {
+          const prop = agg[op];
+          if (!prop) continue;
+          // compactProps already reduces to scalar; handle both scalar and Notion property object
+          const nums = pages.map(p => {
+            const v = p.properties[prop];
+            return typeof v === "number" ? v : extractNum(v);
+          }).filter(n => typeof n === "number" && !isNaN(n));
+          if (!nums.length) continue;
+          const sum = nums.reduce((a, b) => a + b, 0);
+          if (op === "sum")   out.aggregations[`sum_${prop}`]   = sum;
+          if (op === "avg")   out.aggregations[`avg_${prop}`]   = sum / nums.length;
+          if (op === "min")   out.aggregations[`min_${prop}`]   = Math.min(...nums);
+          if (op === "max")   out.aggregations[`max_${prop}`]   = Math.max(...nums);
+          if (op === "first") out.aggregations[`first_${prop}`] = nums[0];
+          if (op === "last")  out.aggregations[`last_${prop}`]  = nums[nums.length - 1];
+          if (op === "delta") out.aggregations[`delta_${prop}`] = nums[nums.length - 1] - nums[0];
+        }
+        // only_agg:true → aggregations only (skip results to save tokens)
+        if (agg.only_agg) {
+          return { result_count: pages.length, aggregations: out.aggregations };
+        }
+      }
+      return out;
+    }
+
+    case "n_get_page": {
+      const p = await notionReq(nt, "GET", `/pages/${normalizeId(args.page_id)}`);
+      return { id: p.id, url: p.url, created_time: p.created_time, last_edited_time: p.last_edited_time, properties: p.properties };
+    }
+
+    case "n_get_blocks": {
+      const id = normalizeId(args.page_id);
+      const pageSize = args.page_size ?? 100;
+      const res = await notionReq(nt, "GET", `/blocks/${id}/children?page_size=${pageSize}`);
+      const extractText = (richTexts) => (richTexts || []).map(t => t.plain_text).join("");
+      const blocks = res.results.map(b => {
+        const type = b.type;
+        const content = b[type];
+        let text = "";
+        if (content?.rich_text) text = extractText(content.rich_text);
+        if (content?.title)     text = extractText(content.title);
+        return { id: b.id, type, text, has_children: b.has_children };
+      });
+      return { block_count: blocks.length, has_more: res.has_more, next_cursor: res.next_cursor, blocks };
+    }
+
+    // ★ FIX: handler was missing in original
+    case "n_create_database": {
+      const body = {
+        parent: { page_id: normalizeId(args.parent_page_id) },
+        title: [{ type: "text", text: { content: args.title } }],
+        properties: args.properties,
+      };
+      if (args.icon) body.icon = { type: "emoji", emoji: args.icon };
+      const db = await notionReq(nt, "POST", "/databases", body);
+      return { id: db.id, url: db.url, title: args.title };
+    }
+
+    // ★ FIX: handler was missing in original
+    case "n_update_schema": {
+      const id = normalizeId(args.database_id);
+      const body = {};
+      if (args.title) {
+        body.title = [{ type: "text", text: { content: args.title } }];
+      }
+      if (args.add || args.remove) {
+        body.properties = {};
+        if (args.add) {
+          Object.assign(body.properties, args.add);
+        }
+        if (args.remove) {
+          for (const col of args.remove) {
+            body.properties[col] = null;
+          }
+        }
+      }
+      const db = await notionReq(nt, "PATCH", `/databases/${id}`, body);
+      return { id: db.id, url: db.url, last_edited_time: db.last_edited_time };
+    }
+
+    case "n_create_page": {
+      const id = normalizeId(args.database_id);
+      const body = {
+        parent: { database_id: id },
+        properties: resolvePropDates(normalizeProperties(args.properties)),
+      };
+      if (args.content) {
+        const blocks = mdToBlocks(args.content);
+        if (blocks.length) body.children = blocks;
+      }
+      const p = await notionReq(nt, "POST", "/pages", body);
+      return { id: p.id, url: p.url, created_time: p.created_time };
+    }
+
+    case "n_update_page": {
+      const pid = normalizeId(args.page_id);
+      // 1. Property / archived update
+      if (args.properties || args.archived !== undefined) {
+        const body = {};
+        if (args.properties) body.properties = resolvePropDates(normalizeProperties(args.properties));
+        if (args.archived !== undefined) body.archived = args.archived;
+        await notionReq(nt, "PATCH", `/pages/${pid}`, body);
+      }
+      // 2. replace_content: delete all existing blocks then append new ones
+      if (args.replace_content !== undefined) {
+        const existing = await notionReq(nt, "GET", `/blocks/${pid}/children?page_size=100`);
+        for (const blk of existing.results) {
+          await notionReq(nt, "DELETE", `/blocks/${blk.id}`, undefined).catch(() => {});
+        }
+        const newBlocks = mdToBlocks(args.replace_content);
+        if (newBlocks.length) {
+          await notionReq(nt, "PATCH", `/blocks/${pid}/children`, { children: newBlocks });
+        }
+      }
+      // 3. append_content: append blocks after existing content
+      if (args.append_content) {
+        const appendBlocks = mdToBlocks(args.append_content);
+        if (appendBlocks.length) {
+          await notionReq(nt, "PATCH", `/blocks/${pid}/children`, { children: appendBlocks });
+        }
+      }
+      const p = await notionReq(nt, "GET", `/pages/${pid}`);
+      return { id: p.id, url: p.url, last_edited_time: p.last_edited_time };
+    }
+
+    case "n_search": {
+      const body = { query: args.query, page_size: args.page_size ?? 10 };
+      if (args.type) body.filter = { value: args.type, property: "object" };
+      const res = await notionReq(nt, "POST", "/search", body);
+      return {
+        results: res.results.map(r => ({
+          id: r.id, type: r.object, url: r.url,
+          title: r.title?.[0]?.plain_text ?? r.properties?.title?.title?.[0]?.plain_text ?? "(untitled)",
+          last_edited_time: r.last_edited_time,
+        })),
+        has_more: res.has_more,
+      };
+    }
+
+    // ── Todoist ──
+    case "t_get_projects": {
+      const raw = await todoistReq(tt, "GET", "/projects");
+      const items = Array.isArray(raw) ? raw : (raw?.results ?? []);
+      return formatTodoistList(items, (p) => compactProject(p), args);
+    }
+
+    case "t_get_sections": {
+      const raw = await todoistReq(tt, "GET", `/sections?project_id=${args.project_id}`);
+      const items = Array.isArray(raw) ? raw : (raw?.results ?? []);
+      return formatTodoistList(items, (s) => compactSection(s), args);
+    }
+
+    case "t_create_section": {
+      const body = { name: args.name, project_id: args.project_id };
+      if (args.order !== undefined) body.order = args.order;
+      return todoistReq(tt, "POST", "/sections", body);
+    }
+
+    case "t_get_labels":
+      return todoistReq(tt, "GET", "/labels");
+
+    case "t_create_project": {
+      const body = { name: args.name };
+      if (args.color)       body.color = args.color;
+      if (args.is_favorite !== undefined) body.is_favorite = args.is_favorite;
+      return todoistReq(tt, "POST", "/projects", body);
+    }
+
+    case "t_update_project": {
+      const { project_id, ...rest } = args;
+      const body = {};
+      if (rest.name)        body.name = rest.name;
+      if (rest.color)       body.color = rest.color;
+      if (rest.is_favorite !== undefined) body.is_favorite = rest.is_favorite;
+      return todoistReq(tt, "POST", `/projects/${project_id}`, body);
+    }
+
+    case "t_delete_project":
+      await todoistReq(tt, "DELETE", `/projects/${args.project_id}`);
+      return { success: true, project_id: args.project_id };
+
+    case "t_update_section":
+      return todoistReq(tt, "POST", `/sections/${args.section_id}`, { name: args.name });
+
+    case "t_delete_section":
+      await todoistReq(tt, "DELETE", `/sections/${args.section_id}`);
+      return { success: true, section_id: args.section_id };
+
+    case "t_get_task": {
+      const raw = await todoistReq(tt, "GET", `/tasks/${args.task_id}`);
+      if (args.compact === false) return raw;
+      // Resolve section name if 'section' field is requested
+      const f = args.fields || TASK_COMPACT_DEFAULTS;
+      let secMap = null;
+      if (f.includes("section") && raw.section_id && raw.project_id) {
+        const { map } = await buildSectionMap(tt, raw.project_id);
+        secMap = map;
+      }
+      return compactTask(raw, args.fields, secMap);
+    }
+
+    case "t_get_tasks": {
+      // Resolve section name → section_id
+      let sectionId = args.section_id;
+      let sectionMap = null;
+      const needsSectionName = (args.fields || TASK_COMPACT_DEFAULTS).includes("section");
+
+      if (args.section || needsSectionName) {
+        // Need to fetch sections: for name resolution and/or output mapping
+        const pid = args.project_id;
+        if (!pid) return { error: "project_id is required when using section name or section output field" };
+        const { map, sections } = await buildSectionMap(tt, pid);
+        sectionMap = map;
+        // Resolve section name → id
+        if (args.section) {
+          const match = sections.find(s =>
+            s.name === args.section || s.name.includes(args.section)
+          );
+          if (!match) return { error: `Section not found: "${args.section}". Available: ${sections.map(s => s.name).join(", ")}` };
+          sectionId = match.id;
+        }
+      }
+
+      const params = new URLSearchParams();
+      if (args.project_id) params.set("project_id", args.project_id);
+      if (sectionId)       params.set("section_id", sectionId);
+      if (args.label)      params.set("label", args.label);
+      if (args.filter)     params.set("filter", args.filter);
+      if (args.ids?.length) params.set("ids", args.ids.join(","));
+      if (args.limit)      params.set("limit", String(args.limit));
+      const qs = params.toString();
+      const raw = await todoistReq(tt, "GET", `/tasks${qs ? "?" + qs : ""}`);
+      const items = Array.isArray(raw) ? raw : (raw?.results ?? []);
+      return formatTodoistList(items, (t) => compactTask(t, args.fields, sectionMap), args);
+    }
+
+    case "t_create_task": {
+      const body = { content: args.content };
+      if (args.project_id)  body.project_id = args.project_id;
+      if (args.section_id)  body.section_id = args.section_id;
+      if (args.parent_id)   body.parent_id = args.parent_id;
+      if (args.labels)      body.labels = args.labels;
+      if (args.priority)    body.priority = args.priority;
+      if (args.description) body.description = args.description;
+      if (args.order !== undefined) body.order = args.order;
+      if (args.due_date)   body.due_date = evalDate(args.due_date);
+      if (args.due_string) body.due_string = args.due_string;
+      return todoistReq(tt, "POST", "/tasks", body);
+    }
+
+    case "t_update_task": {
+      const { task_id, ...rest } = args;
+      const body = {};
+      if (rest.content)     body.content = rest.content;
+      if (rest.labels)      body.labels = rest.labels;
+      if (rest.priority)    body.priority = rest.priority;
+      if (rest.description) body.description = rest.description;
+      if (rest.section_id)  body.section_id = rest.section_id;
+      if (rest.project_id)  body.project_id = rest.project_id;
+      if (rest.parent_id !== undefined) body.parent_id = (rest.parent_id === "" || rest.parent_id === "none") ? null : rest.parent_id;
+      if (rest.due_date)    body.due_date = evalDate(rest.due_date);
+      if (rest.due_string)  body.due_string = rest.due_string;
+      return todoistReq(tt, "POST", `/tasks/${task_id}`, body);
+    }
+
+    case "t_close_task":
+      await todoistReq(tt, "POST", `/tasks/${args.task_id}/close`);
+      return { success: true, task_id: args.task_id };
+
+    case "t_reopen_task":
+      await todoistReq(tt, "POST", `/tasks/${args.task_id}/reopen`);
+      return { success: true, task_id: args.task_id };
+
+    case "t_get_completed_tasks": {
+      // Unified API v1: GET /api/v1/tasks/completed/by_completion_date
+      // since & until are required by the API; default to last 7 days
+      const since = evalDate(args.since ?? "today-7d");
+      const until = evalDate(args.until ?? "today");
+      const params = new URLSearchParams();
+      params.set("since", since + "T00:00:00Z");
+      params.set("until", until + "T23:59:59Z");
+      if (args.limit)      params.set("limit", String(args.limit));
+      const qs = params.toString();
+      const data = await todoistReq(tt, "GET", `/tasks/completed/by_completion_date?${qs}`);
+      let items = Array.isArray(data) ? data : (data?.items ?? data?.results ?? []);
+      // Worker-side filtering (API does not support these server-side)
+      if (args.section_id) items = items.filter(t => t.section_id === args.section_id);
+      if (args.project_id) items = items.filter(t => t.project_id === args.project_id);
+      // Default fields for completed tasks include completed_at + section name
+      const defaultFields = args.fields || ["id", "section", "co", "content", "labels", "due", "cat"];
+      // Build sectionMap if section name output is needed
+      let sectionMap = null;
+      if (defaultFields.includes("section") && args.project_id) {
+        const { map } = await buildSectionMap(tt, args.project_id);
+        sectionMap = map;
+      }
+      return formatTodoistList(items, (t) => compactTask(t, defaultFields, sectionMap), args);
+    }
+
+    case "t_delete_task":
+      await todoistReq(tt, "DELETE", `/tasks/${args.task_id}`);
+      return { success: true, task_id: args.task_id };
+
+    case "t_bulk": {
+      const ops = args.operations ?? [];
+      if (!ops.length) return { error: "No operations provided" };
+
+      // Execute a single operation, reusing existing handler logic
+      const execOp = async (op, idx) => {
+        try {
+          switch (op.action) {
+            case "update": {
+              if (!op.task_id) throw new Error("task_id required for update");
+              const body = {};
+              if (op.content)     body.content = op.content;
+              if (op.labels)      body.labels = op.labels;
+              if (op.priority)    body.priority = op.priority;
+              if (op.description) body.description = op.description;
+              if (op.section_id)  body.section_id = op.section_id;
+              if (op.project_id)  body.project_id = op.project_id;
+              if (op.parent_id !== undefined) body.parent_id = (op.parent_id === "" || op.parent_id === "none") ? null : op.parent_id;
+              if (op.due_date)    body.due_date = evalDate(op.due_date);
+              if (op.due_string)  body.due_string = op.due_string;
+              await todoistReq(tt, "POST", `/tasks/${op.task_id}`, body);
+              return { idx, action: "update", task_id: op.task_id, ok: true };
+            }
+            case "close": {
+              if (!op.task_id) throw new Error("task_id required for close");
+              await todoistReq(tt, "POST", `/tasks/${op.task_id}/close`);
+              return { idx, action: "close", task_id: op.task_id, ok: true };
+            }
+            case "delete": {
+              if (!op.task_id) throw new Error("task_id required for delete");
+              await todoistReq(tt, "DELETE", `/tasks/${op.task_id}`);
+              return { idx, action: "delete", task_id: op.task_id, ok: true };
+            }
+            case "create": {
+              if (!op.content) throw new Error("content required for create");
+              const body = { content: op.content };
+              if (op.project_id)  body.project_id = op.project_id;
+              if (op.section_id)  body.section_id = op.section_id;
+              if (op.parent_id)   body.parent_id = op.parent_id;
+              if (op.labels)      body.labels = op.labels;
+              if (op.priority)    body.priority = op.priority;
+              if (op.description) body.description = op.description;
+              if (op.order !== undefined) body.order = op.order;
+              if (op.due_date)    body.due_date = evalDate(op.due_date);
+              if (op.due_string)  body.due_string = op.due_string;
+              const created = await todoistReq(tt, "POST", "/tasks", body);
+              return { idx, action: "create", task_id: created.id, ok: true };
+            }
+            default:
+              throw new Error(`Unknown action: ${op.action}`);
+          }
+        } catch (e) {
+          return { idx, action: op.action, task_id: op.task_id, ok: false, error: e.message };
+        }
+      };
+
+      // Run with concurrency limit of 3 to avoid rate limits
+      const results = [];
+      for (let i = 0; i < ops.length; i += 3) {
+        const batch = ops.slice(i, i + 3).map((op, j) => execOp(op, i + j));
+        results.push(...await Promise.all(batch));
+      }
+      const succeeded = results.filter(r => r.ok).length;
+      const failed = results.filter(r => !r.ok).length;
+      return { total: ops.length, succeeded, failed, results };
+    }
+
+    case "help": {
+      const config = {};
+      if (env.NOTION_DB_IDS) {
+        try { config.notion_dbs = JSON.parse(env.NOTION_DB_IDS); } catch {}
+      }
+      if (env.TODOIST_CONFIG) {
+        try { config.todoist = JSON.parse(env.TODOIST_CONFIG); } catch {}
+      }
+      return {
+        tools: TOOLS.map(t => ({ name: t.name, inputSchema: t.inputSchema })),
+        ...config,
+      };
+    }
+
+    default:
+      throw new Error(`Unknown tool: ${name}`);
+  }
+}
+
+// ─────────────────────────────────────────────
+// MCP JSON-RPC handler
+// ─────────────────────────────────────────────
+async function handleMCP(request, env) {
+  if (request.method !== "POST") return new Response("Method Not Allowed", { status: 405 });
+
+  let body;
+  try { body = await request.json(); }
+  catch { return rpcErr(null, -32700, "Parse error"); }
+
+  const { id, method, params } = body;
+
+  try {
+    let result;
+    switch (method) {
+      case "initialize":
+        result = {
+          protocolVersion: MCP_VERSION,
+          capabilities: { tools: {} },
+          serverInfo: { name: "notion-todoist-mcp", version: "1.5.0" },
+        };
+        break;
+
+      case "notifications/initialized":
+        return new Response(null, { status: 204 });
+
+      case "ping":
+        result = {};
+        break;
+
+      case "tools/list":
+        result = { tools: TOOLS };
+        break;
+
+      case "tools/call": {
+        const toolResult = await runTool(env, params.name, params.arguments ?? {});
+        result = { content: [{ type: "text", text: JSON.stringify(toolResult, null, 2) }] };
+        break;
+      }
+
+      default:
+        return rpcErr(id, -32601, `Method not found: ${method}`);
+    }
+
+    return jsonResp({ jsonrpc: "2.0", id, result });
+  } catch (err) {
+    return rpcErr(id, -32000, err.message);
+  }
+}
+
+function jsonResp(obj, status = 200) {
+  return new Response(JSON.stringify(obj), {
+    status,
+    headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" },
+  });
+}
+
+function rpcErr(id, code, message) {
+  return jsonResp({ jsonrpc: "2.0", id, error: { code, message } });
+}
+
+// ─────────────────────────────────────────────
+// Entry point
+// ─────────────────────────────────────────────
+export default {
+  async fetch(request, env) {
+    if (request.method === "OPTIONS") {
+      return new Response(null, {
+        headers: {
+          "Access-Control-Allow-Origin": "*",
+          "Access-Control-Allow-Methods": "POST, GET, OPTIONS",
+          "Access-Control-Allow-Headers": "Content-Type, Authorization",
+        },
+      });
+    }
+
+    const url = new URL(request.url);
+    if (url.pathname === "/" || url.pathname === "/mcp") {
+      return handleMCP(request, env);
+    }
+
+    // Health check
+    if (url.pathname === "/health") {
+      return jsonResp({ status: "ok", tools: TOOLS.length });
+    }
+
+    return new Response("Notion + Todoist MCP Server", { status: 200 });
+  },
+};
