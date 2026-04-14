@@ -5,3 +5,7 @@ compatibility_date = "2024-11-01"
 # Secrets are set via CLI (not stored here):
 #   wrangler secret put NOTION_TOKEN
 #   wrangler secret put TODOIST_TOKEN
+
+[vars]
+NOTION_DB_IDS = '{"state":"6492f29c6eee4437af8acb5be76b5654","metrics":"724d65c928b94a6d8d1ad8a7f685178f","events":"8282de48503247bc89481c507b4fec74","food_master":"6442450befed40dc94d3fed7a8411157","habits_page":"3345c9c885a3812c906ec0e1012fd69f"}'
+TODOIST_CONFIG = '{"inbox_project_id":"6g8v9q87rGcggMM6"}'
