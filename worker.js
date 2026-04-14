@@ -555,8 +555,9 @@ const TOOLS = [
   {
     name: "t_get_tasks",
     description:
-      "Get Todoist tasks. Filter by section (name), section_id, project_id, label, filter, or ids[]. " +
-      "section: resolve by name (e.g. 'ワクチン接種') — requires project_id. " +
+      "Get Todoist tasks. project_id defaults to Inbox from config (no arg needed for typical use). " +
+      "Filter by section (name), section_id, label, filter, or ids[]. " +
+      "section: resolve by name (e.g. 'ワクチン接種'). " +
       "compact (default true) returns id/section/co/content/labels/due. " +
       "Default format: tsv. fields: id,section,sid,co,content,labels,due,pid,pri,desc,proj,rec,cat.",
     inputSchema: {
@@ -700,7 +701,8 @@ const TOOLS = [
     description:
       "Query a Notion database. Accepts collection:// IDs. compact:true (default) compresses output. fetch_all:true auto-paginates (max 500). " +
       "Date expressions supported in filters: today, today+7d, today-30d, etc. " +
-      "Optional aggregate: {count, sum, avg, min, max} by property name.",
+      "Optional aggregate: {count, sum, avg, min, max} by property name. " +
+      "fields: restrict returned properties to listed names (e.g. [\"ドメイン\"] for index-only fetch).",
     inputSchema: {
       type: "object",
       properties: {
@@ -711,6 +713,7 @@ const TOOLS = [
         start_cursor: { type: "string" },
         compact: { type: "boolean", default: true },
         fetch_all: { type: "boolean" },
+        fields: { type: "array", items: { type: "string" }, description: "Restrict returned properties to these names only. e.g. [\"ドメイン\"] returns id + ドメイン only." },
         aggregate: {
           type: "object",
           properties: {
@@ -871,7 +874,7 @@ const TOOLS = [
   {
     name: "t_get_completed_tasks",
     description:
-      "Get completed Todoist tasks. Defaults to the last 7 days. " +
+      "Get completed Todoist tasks. Defaults to the last 7 days, Inbox project. " +
       "section_id / project_id are filtered Worker-side (not by Todoist API). " +
       "Use for /review step 3: checking which #1 tasks finished so next can be promoted. " +
       "compact:true (default) strips fields. format:'tsv' for token savings.",
@@ -1000,6 +1003,16 @@ const TOOLS = [
     },
   },
 
+  // ── Context (conversation bootstrap) ──────
+  {
+    name: "context",
+    description:
+      "Single-call conversation bootstrap. Returns Todoist all tasks (Inbox) + Notion habits page blocks in parallel. " +
+      "No arguments required — reads inbox_project_id from TODOIST_CONFIG and habits_page from NOTION_DB_IDS. " +
+      "Call this once at the start of every conversation.",
+    inputSchema: { type: "object", properties: {} },
+  },
+
   // ── Meta ──────────────────────────────────
   {
     name: "help",
@@ -1089,11 +1102,15 @@ async function runTool(env, name, args) {
         fetchCount++;
 
         for (const p of res.results) {
+          let props = args.compact !== false ? compactProps(p.properties) : p.properties;
+          if (args.fields && args.fields.length) {
+            props = Object.fromEntries(args.fields.map(f => [f, props[f] ?? null]));
+          }
           allPages.push({
             id: p.id, url: p.url,
             created_time: p.created_time,
             last_edited_time: p.last_edited_time,
-            properties: args.compact !== false ? compactProps(p.properties) : p.properties,
+            properties: props,
           });
         }
 
@@ -1319,18 +1336,22 @@ async function runTool(env, name, args) {
     }
 
     case "t_get_tasks": {
+      // Default project_id from config if not specified and no filter/label/ids
+      let projectId = args.project_id;
+      if (!projectId && !args.filter && !args.label && !args.ids?.length) {
+        try { projectId = JSON.parse(env.TODOIST_CONFIG).inbox_project_id; } catch {}
+      }
+
       // Resolve section name → section_id
       let sectionId = args.section_id;
       let sectionMap = null;
       const needsSectionName = (args.fields || TASK_COMPACT_DEFAULTS).includes("section");
 
       if (args.section || needsSectionName) {
-        // Need to fetch sections: for name resolution and/or output mapping
-        const pid = args.project_id;
+        const pid = projectId || args.project_id;
         if (!pid) return { error: "project_id is required when using section name or section output field" };
         const { map, sections } = await buildSectionMap(tt, pid);
         sectionMap = map;
-        // Resolve section name → id
         if (args.section) {
           const match = sections.find(s =>
             s.name === args.section || s.name.includes(args.section)
@@ -1341,7 +1362,7 @@ async function runTool(env, name, args) {
       }
 
       const params = new URLSearchParams();
-      if (args.project_id) params.set("project_id", args.project_id);
+      if (projectId)       params.set("project_id", projectId);
       if (sectionId)       params.set("section_id", sectionId);
       if (args.label)      params.set("label", args.label);
       if (args.filter)     params.set("filter", args.filter);
@@ -1395,6 +1416,11 @@ async function runTool(env, name, args) {
       // since & until are required by the API; default to last 7 days
       const since = evalDate(args.since ?? "today-7d");
       const until = evalDate(args.until ?? "today");
+      // Default project_id from config
+      let completedPid = args.project_id;
+      if (!completedPid) {
+        try { completedPid = JSON.parse(env.TODOIST_CONFIG).inbox_project_id; } catch {}
+      }
       const params = new URLSearchParams();
       params.set("since", since + "T00:00:00Z");
       params.set("until", until + "T23:59:59Z");
@@ -1404,13 +1430,13 @@ async function runTool(env, name, args) {
       let items = Array.isArray(data) ? data : (data?.items ?? data?.results ?? []);
       // Worker-side filtering (API does not support these server-side)
       if (args.section_id) items = items.filter(t => t.section_id === args.section_id);
-      if (args.project_id) items = items.filter(t => t.project_id === args.project_id);
+      if (completedPid) items = items.filter(t => t.project_id === completedPid);
       // Default fields for completed tasks include completed_at + section name
       const defaultFields = args.fields || ["id", "section", "co", "content", "labels", "due", "cat"];
       // Build sectionMap if section name output is needed
       let sectionMap = null;
-      if (defaultFields.includes("section") && args.project_id) {
-        const { map } = await buildSectionMap(tt, args.project_id);
+      if (defaultFields.includes("section") && completedPid) {
+        const { map } = await buildSectionMap(tt, completedPid);
         sectionMap = map;
       }
       return formatTodoistList(items, (t) => compactTask(t, defaultFields, sectionMap), args);
@@ -1487,6 +1513,39 @@ async function runTool(env, name, args) {
       return { total: ops.length, succeeded, failed, results };
     }
 
+    case "context": {
+      // Resolve config
+      let inboxPid, habitsPageId;
+      try { inboxPid = JSON.parse(env.TODOIST_CONFIG).inbox_project_id; } catch {}
+      try { habitsPageId = JSON.parse(env.NOTION_DB_IDS).habits_page; } catch {}
+      if (!inboxPid) return { error: "TODOIST_CONFIG.inbox_project_id not set" };
+      if (!habitsPageId) return { error: "NOTION_DB_IDS.habits_page not set" };
+
+      // Parallel fetch: Todoist tasks (with section map) + Notion habits blocks
+      const [tasksResult, habitsResult] = await Promise.all([
+        (async () => {
+          const { map: sectionMap } = await buildSectionMap(tt, inboxPid);
+          const params = new URLSearchParams({ project_id: inboxPid });
+          const raw = await todoistReq(tt, "GET", `/tasks?${params}`);
+          const items = Array.isArray(raw) ? raw : (raw?.results ?? []);
+          return toTSV(items.map(t => compactTask(t, TASK_COMPACT_DEFAULTS, sectionMap)));
+        })(),
+        (async () => {
+          const res = await notionReq(nt, "GET", `/blocks/${normalizeId(habitsPageId)}/children?page_size=100`);
+          const extractText = (rt) => (rt || []).map(t => t.plain_text).join("");
+          return res.results.map(b => {
+            const c = b[b.type];
+            let text = "";
+            if (c?.rich_text) text = extractText(c.rich_text);
+            if (c?.title)     text = extractText(c.title);
+            return text;
+          }).filter(t => t.length > 0).join("\n");
+        })(),
+      ]);
+
+      return { todoist_tasks: tasksResult, habits: habitsResult };
+    }
+
     case "help": {
       const config = {};
       if (env.NOTION_DB_IDS) {
@@ -1509,8 +1568,22 @@ async function runTool(env, name, args) {
 // ─────────────────────────────────────────────
 // MCP JSON-RPC handler
 // ─────────────────────────────────────────────
-async function handleMCP(request, env) {
+async function handleMCP(request, url, env) {
   if (request.method !== "POST") return new Response("Method Not Allowed", { status: 405 });
+
+  const authHeader = request.headers.get("Authorization") ?? "";
+  const token = authHeader.replace(/^Bearer\s+/i, "");
+  const verified = token ? await verifyToken(token, "access", env).catch(() => null) : null;
+  if (!verified) {
+    const resourceMeta = `${url.origin}/.well-known/oauth-protected-resource`;
+    return new Response(JSON.stringify({ error: "unauthorized" }), {
+      status: 401,
+      headers: {
+        "Content-Type": "application/json",
+        "WWW-Authenticate": `Bearer realm="mcp", resource_metadata="${resourceMeta}"`,
+      },
+    });
+  }
 
   let body;
   try { body = await request.json(); }
@@ -1525,7 +1598,7 @@ async function handleMCP(request, env) {
         result = {
           protocolVersion: MCP_VERSION,
           capabilities: { tools: {} },
-          serverInfo: { name: "notion-todoist-mcp", version: "1.5.0" },
+          serverInfo: { name: "notion-todoist-mcp", version: "1.6.0" },
         };
         break;
 
@@ -1568,27 +1641,236 @@ function rpcErr(id, code, message) {
 }
 
 // ─────────────────────────────────────────────
+// OAuth 2.1 (stateless, HMAC-signed tokens — single-user)
+// ─────────────────────────────────────────────
+const b64u = {
+  enc: (buf) => {
+    const bytes = buf instanceof Uint8Array ? buf : new Uint8Array(buf);
+    let s = "";
+    for (const b of bytes) s += String.fromCharCode(b);
+    return btoa(s).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+  },
+  dec: (str) => {
+    const s = str.replace(/-/g, "+").replace(/_/g, "/") + "===".slice((str.length + 3) % 4);
+    const bin = atob(s);
+    const out = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+    return out;
+  },
+  encStr: (s) => b64u.enc(new TextEncoder().encode(s)),
+  decStr: (s) => new TextDecoder().decode(b64u.dec(s)),
+};
+
+async function hmacKey(secret) {
+  return crypto.subtle.importKey(
+    "raw",
+    new TextEncoder().encode(secret),
+    { name: "HMAC", hash: "SHA-256" },
+    false,
+    ["sign", "verify"],
+  );
+}
+
+async function signToken(payload, env) {
+  if (!env.MCP_SECRET) throw new Error("MCP_SECRET not set");
+  const key = await hmacKey(env.MCP_SECRET);
+  const body = b64u.encStr(JSON.stringify(payload));
+  const sig = await crypto.subtle.sign("HMAC", key, new TextEncoder().encode(body));
+  return `${body}.${b64u.enc(sig)}`;
+}
+
+async function verifyToken(token, expectedTyp, env) {
+  if (!env.MCP_SECRET) return null;
+  const [body, sig] = token.split(".");
+  if (!body || !sig) return null;
+  const key = await hmacKey(env.MCP_SECRET);
+  const ok = await crypto.subtle.verify(
+    "HMAC",
+    key,
+    b64u.dec(sig),
+    new TextEncoder().encode(body),
+  );
+  if (!ok) return null;
+  let payload;
+  try { payload = JSON.parse(b64u.decStr(body)); } catch { return null; }
+  if (payload.typ !== expectedTyp) return null;
+  if (typeof payload.exp !== "number" || payload.exp < Math.floor(Date.now() / 1000)) return null;
+  return payload;
+}
+
+async function sha256b64u(input) {
+  const hash = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(input));
+  return b64u.enc(hash);
+}
+
+const CORS_HEADERS = {
+  "Access-Control-Allow-Origin": "*",
+  "Access-Control-Allow-Methods": "POST, GET, OPTIONS",
+  "Access-Control-Allow-Headers": "Content-Type, Authorization, Mcp-Protocol-Version",
+};
+
+function oauthJson(data, status = 200) {
+  return new Response(JSON.stringify(data), {
+    status,
+    headers: { "Content-Type": "application/json", ...CORS_HEADERS },
+  });
+}
+
+function handleProtectedResourceMetadata(url) {
+  return oauthJson({
+    resource: `${url.origin}/mcp`,
+    authorization_servers: [url.origin],
+    bearer_methods_supported: ["header"],
+  });
+}
+
+function handleAuthServerMetadata(url) {
+  return oauthJson({
+    issuer: url.origin,
+    authorization_endpoint: `${url.origin}/authorize`,
+    token_endpoint: `${url.origin}/token`,
+    registration_endpoint: `${url.origin}/register`,
+    response_types_supported: ["code"],
+    grant_types_supported: ["authorization_code", "refresh_token"],
+    code_challenge_methods_supported: ["S256"],
+    token_endpoint_auth_methods_supported: ["none"],
+    scopes_supported: ["mcp"],
+  });
+}
+
+async function handleRegister(request) {
+  let body = {};
+  try { body = await request.json(); } catch {}
+  return oauthJson({
+    client_id: "mcp-public-client",
+    client_id_issued_at: Math.floor(Date.now() / 1000),
+    redirect_uris: body.redirect_uris ?? [],
+    token_endpoint_auth_method: "none",
+    grant_types: ["authorization_code", "refresh_token"],
+    response_types: ["code"],
+  }, 201);
+}
+
+function loginPage(params, errorMsg) {
+  const hidden = Object.entries(params)
+    .map(([k, v]) => `<input type="hidden" name="${k}" value="${escapeHtml(v ?? "")}">`)
+    .join("");
+  const err = errorMsg ? `<p style="color:#b00">${escapeHtml(errorMsg)}</p>` : "";
+  return new Response(
+    `<!doctype html><html><head><meta charset="utf-8"><title>MCP Sign-in</title>
+<style>body{font-family:system-ui;max-width:420px;margin:80px auto;padding:0 20px}
+input[type=password]{width:100%;padding:10px;font-size:16px;box-sizing:border-box}
+button{margin-top:12px;padding:10px 20px;font-size:16px;cursor:pointer}</style></head>
+<body><h2>MCP Server Sign-in</h2>
+<p>Enter your <code>MCP_SECRET</code> to authorize this client.</p>
+${err}<form method="POST" action="/authorize">${hidden}
+<input type="password" name="secret" autofocus required>
+<button type="submit">Authorize</button></form></body></html>`,
+    { status: errorMsg ? 401 : 200, headers: { "Content-Type": "text/html; charset=utf-8" } },
+  );
+}
+
+function escapeHtml(s) {
+  return String(s).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+}
+
+async function handleAuthorize(request, url, env) {
+  if (request.method === "GET") {
+    const p = Object.fromEntries(url.searchParams);
+    if (!p.redirect_uri || !p.code_challenge || p.code_challenge_method !== "S256") {
+      return new Response("invalid_request: redirect_uri and PKCE S256 required", { status: 400 });
+    }
+    return loginPage(p);
+  }
+  if (request.method === "POST") {
+    const form = await request.formData();
+    const p = Object.fromEntries(form);
+    if (!env.MCP_SECRET || p.secret !== env.MCP_SECRET) {
+      return loginPage(p, "Invalid secret");
+    }
+    const code = await signToken({
+      typ: "code",
+      exp: Math.floor(Date.now() / 1000) + 300,
+      cc: p.code_challenge,
+      ru: p.redirect_uri,
+    }, env);
+    const redirect = new URL(p.redirect_uri);
+    redirect.searchParams.set("code", code);
+    if (p.state) redirect.searchParams.set("state", p.state);
+    return new Response(null, { status: 302, headers: { Location: redirect.toString() } });
+  }
+  return new Response("Method Not Allowed", { status: 405 });
+}
+
+async function handleToken(request, env) {
+  if (request.method !== "POST") return new Response("Method Not Allowed", { status: 405 });
+  const form = await request.formData();
+  const grant = form.get("grant_type");
+  const now = Math.floor(Date.now() / 1000);
+
+  if (grant === "authorization_code") {
+    const code = form.get("code");
+    const verifier = form.get("code_verifier");
+    const redirectUri = form.get("redirect_uri");
+    const payload = await verifyToken(code ?? "", "code", env).catch(() => null);
+    if (!payload) return oauthJson({ error: "invalid_grant" }, 400);
+    if (payload.ru !== redirectUri) return oauthJson({ error: "invalid_grant" }, 400);
+    const challenge = await sha256b64u(verifier ?? "");
+    if (challenge !== payload.cc) return oauthJson({ error: "invalid_grant" }, 400);
+    const access = await signToken({ typ: "access", exp: now + 3600 }, env);
+    const refresh = await signToken({ typ: "refresh", exp: now + 60 * 60 * 24 * 30 }, env);
+    return oauthJson({
+      access_token: access,
+      token_type: "Bearer",
+      expires_in: 3600,
+      refresh_token: refresh,
+      scope: "mcp",
+    });
+  }
+
+  if (grant === "refresh_token") {
+    const rt = form.get("refresh_token");
+    const payload = await verifyToken(rt ?? "", "refresh", env).catch(() => null);
+    if (!payload) return oauthJson({ error: "invalid_grant" }, 400);
+    const access = await signToken({ typ: "access", exp: now + 3600 }, env);
+    return oauthJson({
+      access_token: access,
+      token_type: "Bearer",
+      expires_in: 3600,
+      scope: "mcp",
+    });
+  }
+
+  return oauthJson({ error: "unsupported_grant_type" }, 400);
+}
+
+// ─────────────────────────────────────────────
 // Entry point
 // ─────────────────────────────────────────────
 export default {
   async fetch(request, env) {
     if (request.method === "OPTIONS") {
-      return new Response(null, {
-        headers: {
-          "Access-Control-Allow-Origin": "*",
-          "Access-Control-Allow-Methods": "POST, GET, OPTIONS",
-          "Access-Control-Allow-Headers": "Content-Type, Authorization",
-        },
-      });
+      return new Response(null, { headers: CORS_HEADERS });
     }
 
     const url = new URL(request.url);
-    if (url.pathname === "/" || url.pathname === "/mcp") {
-      return handleMCP(request, env);
+    const p = url.pathname;
+
+    if (p === "/.well-known/oauth-protected-resource" || p === "/.well-known/oauth-protected-resource/mcp") {
+      return handleProtectedResourceMetadata(url);
+    }
+    if (p === "/.well-known/oauth-authorization-server") {
+      return handleAuthServerMetadata(url);
+    }
+    if (p === "/register") return handleRegister(request);
+    if (p === "/authorize") return handleAuthorize(request, url, env);
+    if (p === "/token") return handleToken(request, env);
+
+    if (p === "/" || p === "/mcp") {
+      return handleMCP(request, url, env);
     }
 
-    // Health check
-    if (url.pathname === "/health") {
+    if (p === "/health") {
       return jsonResp({ status: "ok", tools: TOOLS.length });
     }
 
