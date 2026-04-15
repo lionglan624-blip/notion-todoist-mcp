@@ -410,6 +410,18 @@ function mkRichText(line) {
   return parts.length ? parts : [{ type: "text", text: { content: line } }];
 }
 
+// Notion caps "Append block children" and page-create `children` at 100
+// blocks per request. Longer markdown must be appended in successive
+// batches or the API returns 400 validation_error.
+const NOTION_CHILDREN_BATCH = 100;
+
+async function appendBlocksChunked(token, parentId, blocks) {
+  for (let i = 0; i < blocks.length; i += NOTION_CHILDREN_BATCH) {
+    const chunk = blocks.slice(i, i + NOTION_CHILDREN_BATCH);
+    await notionReq(token, "PATCH", `/blocks/${parentId}/children`, { children: chunk });
+  }
+}
+
 function mdToBlocks(md) {
   if (!md) return [];
   const lines = md.split("\n");
@@ -1262,11 +1274,18 @@ const TOOL_HANDLERS = {
         parent: { database_id: id },
         properties: resolvePropDates(normalizeProperties(args.properties)),
       };
+      let overflowBlocks = [];
       if (args.content) {
         const blocks = mdToBlocks(args.content);
-        if (blocks.length) body.children = blocks;
+        if (blocks.length) {
+          body.children = blocks.slice(0, NOTION_CHILDREN_BATCH);
+          overflowBlocks = blocks.slice(NOTION_CHILDREN_BATCH);
+        }
       }
       const p = await notionReq(nt, "POST", "/pages", body);
+      if (overflowBlocks.length) {
+        await appendBlocksChunked(nt, p.id, overflowBlocks);
+      }
       return { id: p.id, url: p.url, created_time: p.created_time };
   },
 
@@ -1297,7 +1316,7 @@ const TOOL_HANDLERS = {
 
         const newBlocks = mdToBlocks(args.replace_content);
         if (newBlocks.length) {
-          await notionReq(nt, "PATCH", `/blocks/${pid}/children`, { children: newBlocks });
+          await appendBlocksChunked(nt, pid, newBlocks);
         }
         // Only delete old blocks after new content is safely in place.
         // Track deletion failures so the caller knows the page has stale blocks.
@@ -1318,7 +1337,7 @@ const TOOL_HANDLERS = {
       if (args.append_content) {
         const appendBlocks = mdToBlocks(args.append_content);
         if (appendBlocks.length) {
-          await notionReq(nt, "PATCH", `/blocks/${pid}/children`, { children: appendBlocks });
+          await appendBlocksChunked(nt, pid, appendBlocks);
         }
       }
       const p = await notionReq(nt, "GET", `/pages/${pid}`);
