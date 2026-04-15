@@ -363,7 +363,7 @@ function compactProps(properties) {
       case "url":       out[k] = v.url; break;
       case "email":     out[k] = v.email; break;
       case "phone_number": out[k] = v.phone_number; break;
-      case "formula":   out[k] = v.formula?.string ?? v.formula?.number ?? v.formula?.boolean ?? null; break;
+      case "formula":   out[k] = v.formula?.string ?? v.formula?.number ?? v.formula?.boolean ?? v.formula?.date?.start ?? null; break;
       case "relation":  out[k] = v.relation.map(r => r.id); break;
       case "rollup": {
         // Rollup payloads are either a scalar or an array of property-shaped
@@ -376,6 +376,7 @@ function compactProps(properties) {
         };
         out[k] = v.rollup?.number
           ?? v.rollup?.array?.map(rollupItem)
+          ?? v.rollup?.date?.start
           ?? null;
         break;
       }
@@ -394,6 +395,23 @@ function compactProps(properties) {
 //   divider, code fence, paragraph
 //   Inline: **bold**, *italic*, `code`
 // ─────────────────────────────────────────────
+// Notion rejects any single rich_text `text.content` longer than 2000 chars
+// with a validation_error. Split oversize segments into multiple rich_text
+// items (the block itself can hold many segments).
+const NOTION_TEXT_LIMIT = 2000;
+
+function splitLongRichText(parts) {
+  const out = [];
+  for (const p of parts) {
+    const content = p.text?.content ?? "";
+    if (content.length <= NOTION_TEXT_LIMIT) { out.push(p); continue; }
+    for (let i = 0; i < content.length; i += NOTION_TEXT_LIMIT) {
+      out.push({ ...p, text: { ...p.text, content: content.slice(i, i + NOTION_TEXT_LIMIT) } });
+    }
+  }
+  return out;
+}
+
 function mkRichText(line) {
   const parts = [];
   // tokenize inline: **bold**, *italic*, `code`
@@ -407,7 +425,8 @@ function mkRichText(line) {
     last = m.index + m[0].length;
   }
   if (last < line.length) parts.push({ type: "text", text: { content: line.slice(last) } });
-  return parts.length ? parts : [{ type: "text", text: { content: line } }];
+  const final = parts.length ? parts : [{ type: "text", text: { content: line } }];
+  return splitLongRichText(final);
 }
 
 // Notion caps "Append block children" and page-create `children` at 100
@@ -435,8 +454,9 @@ function mdToBlocks(md) {
       const codeLines = [];
       i++;
       while (i < lines.length && !lines[i].startsWith("```")) { codeLines.push(lines[i]); i++; }
+      const codeContent = codeLines.join("\n");
       blocks.push({ object: "block", type: "code",
-        code: { rich_text: [{ type: "text", text: { content: codeLines.join("\n") } }], language: lang } });
+        code: { rich_text: splitLongRichText([{ type: "text", text: { content: codeContent } }]), language: lang } });
       i++; continue;
     }
     // headings
@@ -1522,7 +1542,10 @@ const TOOL_HANDLERS = {
       const params = new URLSearchParams();
       params.set("since", since + "T00:00:00Z");
       params.set("until", until + "T23:59:59Z");
-      if (args.limit)      params.set("limit", String(args.limit));
+      // Schema advertises default 50 / max 200 — enforce both so callers
+      // can't accidentally DoS themselves via an unbounded API call.
+      const limit = Math.min(Math.max(1, args.limit ?? 50), 200);
+      params.set("limit", String(limit));
       const qs = params.toString();
       const data = await todoistReq(tt, "GET", `/tasks/completed/by_completion_date?${qs}`);
       let items = Array.isArray(data) ? data : (data?.items ?? data?.results ?? []);
