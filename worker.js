@@ -189,8 +189,9 @@ function safeMath(expr) {
         if (name.t !== "id") throw new Error(`Expected Math.* name after '.'`);
         consume();
         if (peek().v === "(") {
-          // Function call
-          if (!(name.v in MATH_FN)) throw new Error(`Unknown Math function: Math.${name.v}`);
+          // Function call — hasOwn guards against prototype members like
+          // `constructor` / `toString` leaking through the `in` operator.
+          if (!Object.hasOwn(MATH_FN, name.v)) throw new Error(`Unknown Math function: Math.${name.v}`);
           consume(); // '('
           const args = [];
           if (peek().v !== ")") {
@@ -201,7 +202,7 @@ function safeMath(expr) {
           return MATH_FN[name.v](...args);
         } else {
           // Constant
-          if (!(name.v in MATH_CONST)) throw new Error(`Unknown Math constant: Math.${name.v}`);
+          if (!Object.hasOwn(MATH_CONST, name.v)) throw new Error(`Unknown Math constant: Math.${name.v}`);
           return MATH_CONST[name.v];
         }
       }
@@ -527,7 +528,7 @@ function normalizeProperties(properties) {
           { out[key] = { title: [{ text: { content: val.title } }] }; continue; }
         if (val.select  && typeof val.select === "string")
           { out[key] = { select: { name: val.select } }; continue; }
-        if (val.multi_select && Array.isArray(val.multi_select) && typeof val.multi_select[0] === "string")
+        if (val.multi_select && Array.isArray(val.multi_select) && val.multi_select.every(v => typeof v === "string"))
           { out[key] = { multi_select: val.multi_select.map(n => ({ name: n })) }; continue; }
         if (val.date    && typeof val.date === "string")
           { out[key] = { date: { start: evalDate(val.date) } }; continue; }

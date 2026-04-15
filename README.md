@@ -127,7 +127,12 @@ Add to your Claude Desktop / Claude Code MCP config. The client will perform OAu
 
 ## Customization
 
-The `help` tool returns a static config with pre-configured Notion database IDs and Todoist project IDs. Edit the `help` handler in `worker.js` to match your own workspace setup.
+The `help` and `context` tools read workspace-specific IDs from two JSON-valued Worker vars:
+
+- `NOTION_DB_IDS` — e.g. `{"habits_page":"<page-id>","state":"<db-id>","metrics":"<db-id>"}`
+- `TODOIST_CONFIG` — e.g. `{"inbox_project_id":"<project-id>"}`
+
+Set them in `wrangler.toml` (`[vars]`) or via `npx wrangler secret put` if you prefer to keep IDs out of source control. `context` requires both `TODOIST_CONFIG.inbox_project_id` and `NOTION_DB_IDS.habits_page`.
 
 ## License
 
