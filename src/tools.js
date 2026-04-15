@@ -7,6 +7,7 @@ export const TOOLS = [
     name: "t_get_tasks",
     description:
       "Get Todoist tasks. project_id defaults to Inbox from config (no arg needed for typical use). " +
+      "Pass project_id:\"all\" to fetch tasks across every project (no project filter). " +
       "Filter by section (name), section_id, label, filter, or ids[]. " +
       "section: resolve by name (e.g. 'ワクチン接種'). " +
       "compact (default true) returns id/section/co/content/labels/due. " +
@@ -14,7 +15,7 @@ export const TOOLS = [
     inputSchema: {
       type: "object",
       properties: {
-        project_id: { type: "string" },
+        project_id: { type: "string", description: "Project ID, or \"all\" for cross-project" },
         section: { type: "string", description: "Section name (resolved to section_id by Worker)" },
         section_id: { type: "string" },
         label: { type: "string" },
@@ -123,15 +124,17 @@ export const TOOLS = [
   },
   {
     name: "t_get_sections",
-    description: "Get sections of a Todoist project. compact:true (default) returns id/name/order only.",
+    description:
+      "Get sections of a Todoist project. " +
+      "Omit project_id (or pass \"all\") to list sections across every project. " +
+      "compact:true (default) returns id/name/order (+project_id when cross-project).",
     inputSchema: {
       type: "object",
       properties: {
-        project_id: { type: "string" },
+        project_id: { type: "string", description: "Project ID. Omit or pass \"all\" to list across every project." },
         compact: { type: "boolean", default: true },
         format: { type: "string", enum: ["json", "tsv"] },
       },
-      required: ["project_id"],
     },
   },
   {
@@ -204,7 +207,8 @@ export const TOOLS = [
     name: "n_update_page",
     description:
       "Update properties or body content of a Notion page. " +
-      "archived:true to trash. " +
+      "archived:true moves the page to trash (deletion); archived:false restores. " +
+      "For a deletion-only call, prefer n_delete_page — this is the same archive op wrapped for clarity. " +
       "replace_content: Markdown string to replace the entire page body. " +
       "append_content: Markdown string to append blocks at the end of the page. " +
       "Property shorthand: string→rich_text, number→number, bool→checkbox, " +
@@ -217,6 +221,22 @@ export const TOOLS = [
         archived: { type: "boolean" },
         replace_content: { type: "string", description: "Markdown — replaces all existing blocks" },
         append_content: { type: "string", description: "Markdown — appends blocks after existing content" },
+      },
+      required: ["page_id"],
+    },
+  },
+
+  {
+    name: "n_delete_page",
+    description:
+      "Delete a Notion page by archiving it (moves to trash). " +
+      "Equivalent to n_update_page with archived:true — use this when deletion is the only intent. " +
+      "Pass restore:true to un-archive instead.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        page_id: { type: "string" },
+        restore: { type: "boolean", description: "true = un-archive (restore from trash)" },
       },
       required: ["page_id"],
     },
@@ -288,15 +308,20 @@ export const TOOLS = [
   {
     name: "n_search",
     description:
-      "Search Notion workspace by title. " +
-      "query is optional — omit (or pass empty string) with type:\"database\" to list all databases the integration can access, " +
-      "or with type:\"page\" to list all accessible top-level pages (useful for finding a parent_page_id before n_create_database).",
+      "Search Notion workspace. Default path uses Notion's /search API (title-only — body/property text is NOT indexed). " +
+      "search_body:true enables body-text scan: fans out up to max_scan accessible pages (default 50, max 100), fetches each page's blocks, and filters by substring match against title+body. Expensive; use with a non-empty query. " +
+      "query is optional for the default path — omit (or pass empty string) with type:\"database\" to list all databases the integration can access, " +
+      "or with type:\"page\" to list all accessible top-level pages (useful for finding a parent_page_id before n_create_database). " +
+      "include_properties:true returns compact properties for each page result so the caller can filter client-side.",
     inputSchema: {
       type: "object",
       properties: {
-        query: { type: "string", description: "Title substring; omit to list everything accessible" },
+        query: { type: "string", description: "Substring to match. For default path: title only. For search_body:true: title + body text." },
         type: { type: "string", enum: ["page", "database"] },
         page_size: { type: "number", default: 10 },
+        include_properties: { type: "boolean", description: "Include compact properties for page results (default false)" },
+        search_body: { type: "boolean", description: "Enable full-text body scan (bounded by max_scan). Requires query." },
+        max_scan: { type: "number", description: "Max accessible pages to fetch+scan when search_body:true. Default 50, hard cap 100." },
       },
     },
   },
@@ -465,10 +490,59 @@ export const TOOLS = [
   {
     name: "context",
     description:
-      "Single-call conversation bootstrap. Returns Todoist all tasks (Inbox) + Notion habits page blocks in parallel. " +
-      "No arguments required — reads inbox_project_id from TODOIST_CONFIG and habits_page from NOTION_DB_IDS. " +
-      "Call this once at the start of every conversation.",
-    inputSchema: { type: "object", properties: {} },
+      "Single-call conversation bootstrap. Fetches configured context sources in parallel. " +
+      "Resolution order per slot: per-call args > CONTEXT_CONFIG env var > legacy defaults " +
+      "(TODOIST_CONFIG.inbox_project_id + NOTION_DB_IDS.habits_page). " +
+      "Call this once at the start of every conversation. " +
+      "Args: tasks ({project_id, fields?} or false to skip); pages ([{id, label?}] — full override); " +
+      "extra_pages ([{id, label?}] — appended on top of effective pages); " +
+      "queries ([{database_id, label, filter?, sorts?, page_size?}] — n_query-style compact results).",
+    inputSchema: {
+      type: "object",
+      properties: {
+        tasks: {
+          description: "Todoist tasks config. {project_id, fields?} or false to skip.",
+          oneOf: [
+            { type: "object", properties: { project_id: { type: "string" }, fields: { type: "array", items: { type: "string" } } } },
+            { type: "boolean" },
+            { type: "null" },
+          ],
+        },
+        pages: {
+          type: "array",
+          description: "Full override of Notion pages to fetch. Each: {id, label?}.",
+          items: {
+            type: "object",
+            properties: { id: { type: "string" }, label: { type: "string" } },
+            required: ["id"],
+          },
+        },
+        extra_pages: {
+          type: "array",
+          description: "Notion pages appended on top of the effective pages config.",
+          items: {
+            type: "object",
+            properties: { id: { type: "string" }, label: { type: "string" } },
+            required: ["id"],
+          },
+        },
+        queries: {
+          type: "array",
+          description: "Notion database queries. Each: {database_id, label, filter?, sorts?, page_size?}.",
+          items: {
+            type: "object",
+            properties: {
+              database_id: { type: "string" },
+              label: { type: "string" },
+              filter: { type: "object" },
+              sorts: { type: "array" },
+              page_size: { type: "number" },
+            },
+            required: ["database_id", "label"],
+          },
+        },
+      },
+    },
   },
 
   // ── Meta ──────────────────────────────────

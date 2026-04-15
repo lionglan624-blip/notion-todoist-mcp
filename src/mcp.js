@@ -280,12 +280,14 @@ const TOOL_HANDLERS = {
       return out;
   },
 
+  n_delete_page: async (args, { nt }) => {
+      const pid = normalizeId(args.page_id);
+      const archived = args.restore ? false : true;
+      const p = await notionReq(nt, "PATCH", `/pages/${pid}`, { archived });
+      return { id: p.id, url: p.url, archived: p.archived, last_edited_time: p.last_edited_time };
+  },
+
   n_search: async (args, { nt }) => {
-      // query is optional — Notion accepts an empty query and returns everything
-      // the integration can access, filtered by the object-type filter below.
-      const body = { query: args.query ?? "", page_size: args.page_size ?? 10 };
-      if (args.type) body.filter = { value: args.type, property: "object" };
-      const res = await notionReq(nt, "POST", "/search", body);
       // Page title lives under whichever property is typed "title" — the key
       // is not always "title" (often "Name" or a localized label), so scan.
       const extractPageTitle = (props) => {
@@ -295,12 +297,80 @@ const TOOL_HANDLERS = {
         }
         return null;
       };
+
+      const pageSize = args.page_size ?? 10;
+
+      // search_body:true → body-text scan.
+      // Notion's /search API is title-only, so we fan out: list accessible pages
+      // via empty search, fetch each page's blocks, and filter by substring match
+      // against the combined title + body text. Bounded by max_scan (default 50,
+      // hard cap 100) to avoid runaway API cost.
+      if (args.search_body && args.query) {
+        const needle = String(args.query).toLowerCase();
+        const maxScan = Math.min(Math.max(1, args.max_scan ?? 50), 100);
+        const listBody = { query: "", page_size: maxScan, filter: { value: "page", property: "object" } };
+        const listed = await notionReq(nt, "POST", "/search", listBody);
+
+        // Fetch blocks with concurrency 3 to respect Notion's 3 req/s limit.
+        const scanPage = async (r) => {
+          try {
+            const blocks = await notionReq(nt, "GET", `/blocks/${r.id}/children?page_size=100`);
+            const bodyText = blocks.results.map(b => {
+              const c = b[b.type];
+              if (c?.rich_text) return c.rich_text.map(t => t.plain_text).join("");
+              if (c?.title)     return c.title.map(t => t.plain_text).join("");
+              return "";
+            }).join("\n");
+            const title = r.title?.map(t => t.plain_text).join("") || extractPageTitle(r.properties) || "";
+            const combined = (title + "\n" + bodyText).toLowerCase();
+            return combined.includes(needle) ? { r, title, snippet: bodyText.slice(0, 240) } : null;
+          } catch {
+            return null;
+          }
+        };
+
+        const hits = [];
+        for (let i = 0; i < listed.results.length && hits.length < pageSize; i += 3) {
+          const batch = listed.results.slice(i, i + 3);
+          const batchResults = await Promise.all(batch.map(scanPage));
+          for (const m of batchResults) if (m) hits.push(m);
+        }
+
+        return {
+          scanned: listed.results.length,
+          scan_has_more: listed.has_more,
+          match_count: hits.length,
+          results: hits.slice(0, pageSize).map(({ r, title, snippet }) => {
+            const row = {
+              id: r.id, type: r.object, url: r.url,
+              title: title || "(untitled)",
+              last_edited_time: r.last_edited_time,
+              snippet,
+            };
+            if (args.include_properties && r.properties) {
+              row.properties = compactProps(r.properties);
+            }
+            return row;
+          }),
+        };
+      }
+
+      // Default path: title-only search via Notion API.
+      const body = { query: args.query ?? "", page_size: pageSize };
+      if (args.type) body.filter = { value: args.type, property: "object" };
+      const res = await notionReq(nt, "POST", "/search", body);
       return {
-        results: res.results.map(r => ({
-          id: r.id, type: r.object, url: r.url,
-          title: r.title?.map(t => t.plain_text).join("") || extractPageTitle(r.properties) || "(untitled)",
-          last_edited_time: r.last_edited_time,
-        })),
+        results: res.results.map(r => {
+          const row = {
+            id: r.id, type: r.object, url: r.url,
+            title: r.title?.map(t => t.plain_text).join("") || extractPageTitle(r.properties) || "(untitled)",
+            last_edited_time: r.last_edited_time,
+          };
+          if (args.include_properties && r.object === "page" && r.properties) {
+            row.properties = compactProps(r.properties);
+          }
+          return row;
+        }),
         has_more: res.has_more,
       };
   },
@@ -313,9 +383,16 @@ const TOOL_HANDLERS = {
   },
 
   t_get_sections: async (args, { tt }) => {
-      const raw = await todoistReq(tt, "GET", `/sections?project_id=${args.project_id}`);
+      const crossProject = !args.project_id || args.project_id === "all";
+      const path = crossProject ? "/sections" : `/sections?project_id=${args.project_id}`;
+      const raw = await todoistReq(tt, "GET", path);
       const items = Array.isArray(raw) ? raw : (raw?.results ?? []);
-      return formatTodoistList(items, (s) => compactSection(s), args);
+      // When cross-project, keep project_id in the compact row so callers can
+      // tell which project each section belongs to.
+      const mapper = crossProject
+        ? (s) => ({ ...compactSection(s), project_id: s.project_id })
+        : (s) => compactSection(s);
+      return formatTodoistList(items, mapper, args);
   },
 
   t_create_section: async (args, { tt }) => {
@@ -369,9 +446,11 @@ const TOOL_HANDLERS = {
   },
 
   t_get_tasks: async (args, { env, tt }) => {
+      // project_id:"all" → explicit opt-out of the Inbox default; skip API filter entirely.
+      const crossProject = args.project_id === "all";
       // Default project_id from config if not specified and no filter/label/ids
-      let projectId = args.project_id;
-      if (!projectId && !args.filter && !args.label && !args.ids?.length) {
+      let projectId = crossProject ? undefined : args.project_id;
+      if (!crossProject && !projectId && !args.filter && !args.label && !args.ids?.length) {
         try { projectId = JSON.parse(env.TODOIST_CONFIG).inbox_project_id; } catch {}
       }
 
@@ -381,7 +460,7 @@ const TOOL_HANDLERS = {
       const needsSectionName = (args.fields || TASK_COMPACT_DEFAULTS).includes("section");
 
       if (args.section || needsSectionName) {
-        const pid = projectId || args.project_id;
+        const pid = projectId;
         if (!pid) {
           // Explicit section-name lookup requires a project; defaulted field
           // list ("section") can degrade silently so filter/ids/label calls
@@ -596,41 +675,87 @@ const TOOL_HANDLERS = {
   },
 
   context: async (args, { env, nt, tt }) => {
-      // Resolve config
+      // Resolution order for each slot:
+      //   1. per-call args (args.tasks / args.pages / args.queries)
+      //   2. CONTEXT_CONFIG env var (JSON)
+      //   3. legacy defaults (TODOIST_CONFIG.inbox_project_id + NOTION_DB_IDS.habits_page)
+      let envCfg = {};
+      try { if (env.CONTEXT_CONFIG) envCfg = JSON.parse(env.CONTEXT_CONFIG); } catch {}
+
       let inboxPid, habitsPageId;
       try { inboxPid = JSON.parse(env.TODOIST_CONFIG).inbox_project_id; } catch {}
       try { habitsPageId = JSON.parse(env.NOTION_DB_IDS).habits_page; } catch {}
-      if (!inboxPid) return { error: "TODOIST_CONFIG.inbox_project_id not set" };
-      if (!habitsPageId) return { error: "NOTION_DB_IDS.habits_page not set" };
 
-      // Parallel fetch: Todoist tasks (with section map) + Notion habits blocks
-      const [tasksResult, habitsResult] = await Promise.all([
-        (async () => {
-          const { map: sectionMap } = await buildSectionMap(tt, inboxPid);
-          const params = new URLSearchParams({ project_id: inboxPid });
-          const raw = await todoistReq(tt, "GET", `/tasks?${params}`);
-          const items = Array.isArray(raw) ? raw : (raw?.results ?? []);
-          return toTSV(items.map(t => compactTask(t, TASK_COMPACT_DEFAULTS, sectionMap)));
-        })(),
-        (async () => {
-          const res = await notionReq(nt, "GET", `/blocks/${normalizeId(habitsPageId)}/children?page_size=100`);
-          const extractText = (rt) => (rt || []).map(t => t.plain_text).join("");
-          return res.results.map(b => {
-            const c = b[b.type];
-            let text = "";
-            if (c?.rich_text) text = extractText(c.rich_text);
-            if (c?.title)     text = extractText(c.title);
-            if (!text.trim()) return null;
-            // Add lightweight heading markers so Claude can identify sections
-            if (b.type === "heading_1") return `\n## ${text}`;
-            if (b.type === "heading_2") return `\n### ${text}`;
-            if (b.type === "heading_3") return `#### ${text}`;
-            return text;
-          }).filter(Boolean).join("\n");
-        })(),
-      ]);
+      const legacyTasks = inboxPid ? { project_id: inboxPid } : null;
+      const legacyPages = habitsPageId ? [{ id: habitsPageId, label: "habits" }] : [];
 
-      return { todoist_tasks: tasksResult, habits: habitsResult };
+      // Tasks slot: args > env > legacy. Pass false/null at any layer to skip.
+      const tasksCfg = args.tasks !== undefined
+        ? args.tasks
+        : (envCfg.tasks !== undefined ? envCfg.tasks : legacyTasks);
+
+      // Pages slot: args fully override env, env fully overrides legacy.
+      // extra_pages appends on top of whichever layer is effective.
+      let pagesCfg = args.pages ?? envCfg.pages ?? legacyPages;
+      if (args.extra_pages?.length) pagesCfg = [...pagesCfg, ...args.extra_pages];
+
+      const queriesCfg = args.queries ?? envCfg.queries ?? [];
+
+      const extractBlockText = (rt) => (rt || []).map(t => t.plain_text).join("");
+      const blocksToMarkdown = (blocks) => blocks.map(b => {
+        const c = b[b.type];
+        let text = "";
+        if (c?.rich_text) text = extractBlockText(c.rich_text);
+        if (c?.title)     text = extractBlockText(c.title);
+        if (!text.trim()) return null;
+        if (b.type === "heading_1") return `\n## ${text}`;
+        if (b.type === "heading_2") return `\n### ${text}`;
+        if (b.type === "heading_3") return `#### ${text}`;
+        return text;
+      }).filter(Boolean).join("\n");
+
+      const fetchTasks = async (cfg) => {
+        const pid = cfg.project_id;
+        if (!pid) return null;
+        const { map: sectionMap } = await buildSectionMap(tt, pid);
+        const params = new URLSearchParams({ project_id: pid });
+        const raw = await todoistReq(tt, "GET", `/tasks?${params}`);
+        const items = Array.isArray(raw) ? raw : (raw?.results ?? []);
+        return toTSV(items.map(t => compactTask(t, cfg.fields || TASK_COMPACT_DEFAULTS, sectionMap)));
+      };
+
+      const fetchPage = async (spec) => {
+        const res = await notionReq(nt, "GET", `/blocks/${normalizeId(spec.id)}/children?page_size=100`);
+        return blocksToMarkdown(res.results);
+      };
+
+      const fetchQuery = async (spec) => {
+        const body = { page_size: spec.page_size ?? 20 };
+        if (spec.filter) body.filter = resolveFilterDates(spec.filter);
+        if (spec.sorts)  body.sorts = spec.sorts;
+        const res = await notionReq(nt, "POST", `/databases/${normalizeId(spec.database_id)}/query`, body);
+        return res.results.map(p => ({
+          id: p.id,
+          properties: compactProps(p.properties),
+        }));
+      };
+
+      // Resolve everything in parallel. Empty/falsy slots are skipped.
+      const jobs = [];
+      if (tasksCfg) jobs.push(["todoist_tasks", fetchTasks(tasksCfg)]);
+      for (const page of pagesCfg) {
+        jobs.push([page.label || page.id, fetchPage(page)]);
+      }
+      for (const q of queriesCfg) {
+        if (!q.label) continue;
+        jobs.push([q.label, fetchQuery(q)]);
+      }
+
+      const settled = await Promise.all(jobs.map(([, p]) => p.catch(e => ({ __error: e.message }))));
+      const out = {};
+      jobs.forEach(([label], i) => { out[label] = settled[i]; });
+      if (!jobs.length) return { error: "No context sources configured. Set CONTEXT_CONFIG, TODOIST_CONFIG.inbox_project_id, or NOTION_DB_IDS.habits_page, or pass args." };
+      return out;
   },
 
   help: (args, { env }) => {

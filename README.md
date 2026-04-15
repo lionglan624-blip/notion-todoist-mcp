@@ -2,13 +2,13 @@
 
 A custom [MCP (Model Context Protocol)](https://modelcontextprotocol.io/) server running on Cloudflare Workers that provides Claude with full read/write access to Notion and Todoist. Protected by OAuth 2.1 for use with remote MCP clients.
 
-## Features (32 tools)
+## Features (33 tools)
 
 ### Todoist (18 tools)
 
 | Tool | Description |
 |------|-------------|
-| `t_get_tasks` | Query tasks by project, section (name), section_id, label, filter, or IDs. Compact TSV output by default |
+| `t_get_tasks` | Query tasks by project, section (name), section_id, label, filter, or IDs. `project_id:"all"` for cross-project. Compact TSV output by default |
 | `t_get_task` | Get a single task by ID |
 | `t_create_task` | Create a task with labels, due date, priority, section, subtask support |
 | `t_update_task` | Update any task field including move between projects/sections and reorder within a section |
@@ -19,21 +19,22 @@ A custom [MCP (Model Context Protocol)](https://modelcontextprotocol.io/) server
 | `t_get_completed_tasks` | Query completed tasks with date range filtering |
 | `t_get_projects` | List all projects |
 | `t_create_project` / `t_update_project` / `t_delete_project` | Manage projects |
-| `t_get_sections` | List sections in a project |
+| `t_get_sections` | List sections in a project (omit `project_id` or pass `"all"` for cross-project) |
 | `t_create_section` / `t_update_section` / `t_delete_section` | Manage sections |
 | `t_get_labels` | List all personal labels |
 
-### Notion (9 tools)
+### Notion (10 tools)
 
 | Tool | Description |
 |------|-------------|
 | `n_query` | Query a database with filters, sorts, auto-pagination, and aggregations (sum/avg/min/max/delta) |
 | `n_create_page` | Create a page with property shorthand and Markdown body |
-| `n_update_page` | Update properties, replace or append page body content |
+| `n_update_page` | Update properties, replace or append page body content (`archived:true` trashes the page) |
+| `n_delete_page` | Delete a page by archiving it (convenience wrapper; `restore:true` un-archives) |
 | `n_get_page` | Get a single page with all properties |
 | `n_get_blocks` | Get page body as plain text with heading markers (`##`/`###`/`####`) |
 | `n_get_schema` | Get database property schema |
-| `n_search` | Search workspace by title. `query` is optional — omit with `type:"database"` or `type:"page"` to list everything the integration can access (useful for finding a `parent_page_id` before `n_create_database`) |
+| `n_search` | Search workspace by title, or set `search_body:true` for bounded full-text body scan (fetches blocks for up to `max_scan` accessible pages, default 50, cap 100). `query` optional for title path. `include_properties:true` adds compact properties for client-side filtering |
 | `n_create_database` | Create a new database under a parent page |
 | `n_update_schema` | Add/remove columns, rename, or archive (`archived:true`) a database |
 
@@ -44,7 +45,7 @@ A custom [MCP (Model Context Protocol)](https://modelcontextprotocol.io/) server
 | `eval_date` | Resolve JST date expressions (`today`, `today+7d`, `yesterday`, `today-2w`, `now`, etc.) |
 | `calculate` | Safe math evaluator with `Math.*` support (no `eval`) |
 | `stats` | Compute statistics (count, sum, avg, min, max, median, delta) from a number array |
-| `context` | Fetch combined context (Notion page + Todoist tasks) in one call |
+| `context` | Single-call conversation bootstrap. Fetches configured sources in parallel. Resolution: per-call args > `CONTEXT_CONFIG` env var > legacy defaults (`TODOIST_CONFIG.inbox_project_id` + `NOTION_DB_IDS.habits_page`). Supports `tasks`, `pages`, `extra_pages`, `queries` slots |
 | `help` | Return the full tool list (names + inputSchemas) plus static workspace config (pre-configured database/project IDs) |
 
 ## Key Design Choices

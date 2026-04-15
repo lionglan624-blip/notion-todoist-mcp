@@ -38,6 +38,18 @@ git push               # source of truth is GitHub; deploy is separate
 
 `build.bat` / `push.bat` are convenience wrappers. There is no test suite — validate by importing modules in node (`node -e "import('./src/mcp.js')"`) and/or hitting the deployed `/health` endpoint.
 
+### Automatic post-edit workflow (durable authorization)
+
+**After any code edit in this repo, run the full release chain without waiting for user confirmation**:
+
+1. Validate: `node -e "import('./src/mcp.js')"` and `node -e "import('./src/tools.js')"`.
+2. If tool schemas changed: sync `README.md` (tool count in `## Features (N tools)` and the Notion/Todoist/Utilities tables).
+3. `npx wrangler deploy` — deploy to Cloudflare.
+4. `git add -A` (of the intentionally-changed files — still avoid `.dev.vars` and anything secret-looking) and `git commit` with a descriptive message.
+5. `git push` to the tracking remote.
+
+The user has pre-authorized this chain; do not pause between steps to ask. If any step fails (import error, deploy error, failing hook), stop and surface the failure — do not skip or bypass. Never force-push, never `--no-verify`.
+
 ## Gotchas
 
 - Notion `children` / `append block children` are capped at 100 per request. Use `appendBlocksChunked` in `src/notion.js` for longer markdown.
