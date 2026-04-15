@@ -27,7 +27,7 @@ When adding a tool: add schema to `src/tools.js` AND handler to `src/mcp.js`. Ke
 - **Property shorthand** for Notion properties lives in `normalizeProperties` (`src/notion.js`). Prefer extending it over forcing callers to write full Notion JSON.
 - **Rate limits.** Both `notionReq` and `todoistReq` retry 429s with `Retry-After` + exponential backoff. Don't bypass them.
 - **No secrets in logs.** Upstream error messages are scrubbed of `Bearer <token>` before surfacing. Don't add new log paths that echo request bodies.
-- **Stateless tokens.** OAuth uses HMAC-signed tokens, no KV/DO. Don't introduce storage without discussing the free-tier tradeoff first.
+- **Minimally-stateful tokens.** OAuth tokens are HMAC-signed and self-contained; the only persistent state is the `OAUTH_STATE` KV namespace used to enforce (a) authorization-code single-use and (b) refresh-token rotation with reuse detection. Don't add further storage without discussing the free-tier tradeoff first.
 
 ## Deploy / commit workflow
 
@@ -62,7 +62,7 @@ The user has pre-authorized this chain; do not pause between steps to ask. If an
 - `context` and `help` read workspace-specific IDs from `NOTION_DB_IDS` and `TODOIST_CONFIG` vars. Don't hardcode IDs in source.
 - `/authorize` enforces a `redirect_uri` host allowlist. Default covers `claude.ai` / `claude.com` / `anthropic.com` (with subdomains) + loopback. Override via the `ALLOWED_REDIRECT_HOSTS` env var (comma-separated, supports `*.suffix`) — don't widen the default in source.
 - Login-secret compare is constant-time via SHA-256 equality; don't regress to `===` on raw strings. Rotate `MCP_SIGNING_KEY` to invalidate all live tokens (stateless design has no per-token revocation).
-- **OAuth stateless tradeoffs (accepted)**: authorization codes are *not* one-time-use (RFC 6749 §4.1.2 violation) and refresh tokens do *not* rotate (RFC 6749 §10.4). Both require persistent state to fix and we deliberately avoid KV/DO. Mitigations: codes have a 5-min TTL and are PKCE-bound; refresh tokens are 30-day, audience-bound, and scoped to a single user. If single-user assumption changes, revisit by introducing KV-backed code+refresh tracking.
+- **OAuth state lives in the `OAUTH_STATE` KV namespace.** Authorization codes are single-use (RFC 6749 §4.1.2) and refresh tokens rotate with reuse-detection via family poisoning (RFC 6819 §5.2.2.3). Keys: `code:<jti>` (5-min TTL), `rt:<jti>` (30-day TTL), `fam:<fam>` (30-day TTL when reuse is detected — invalidates the whole lineage). Legacy tokens missing `jti`/`fam` are rejected; any pre-rollout client must re-auth via /authorize.
 - **Todoist IDs go through `assertTodoistId`** before any URL interpolation (and ideally before any body use too). Notion IDs go through `normalizeId`, which now *throws* on non-UUID input. Both block path-pivot attacks (e.g. `task_id:"123/close"` turning an update into a close). Don't bypass — every new handler that takes a user-supplied ID must validate it.
 - **`/authorize` POST checks the `Origin` header** — same-origin or absent only. Browser-form CSRF (autofill / password-manager exploit) is blocked here; absent-Origin (curl/server) is allowed for ops use.
 - **Upstream error messages are truncated to 200 chars** in `notionReq` / `todoistReq` before being thrown. Don't widen — Notion/Todoist echo request bodies in validation errors and unbounded passthrough leaks caller data into MCP error frames.
