@@ -548,6 +548,36 @@ async function todoistReq(token, method, path, body, _attempt = 0) {
 }
 
 // ─────────────────────────────────────────────
+// Todoist Sync API helper
+// Used for operations the REST API does not support, e.g. item_reorder.
+// Sends a batch of commands in one POST to /sync/v9/sync.
+// ─────────────────────────────────────────────
+async function todoistSync(token, commands, _attempt = 0) {
+  const res = await fetch("https://api.todoist.com/api/v1/sync", {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${token}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({ commands }),
+  });
+  if (res.status === 429 && _attempt < 4) {
+    const retryAfter = parseInt(res.headers.get("Retry-After") || "1", 10);
+    await sleep(Math.max(retryAfter * 1000, 400 * Math.pow(2, _attempt)));
+    return todoistSync(token, commands, _attempt + 1);
+  }
+  if (res.status >= 500 && _attempt < 1) {
+    await sleep(500);
+    return todoistSync(token, commands, _attempt + 1);
+  }
+  if (!res.ok) {
+    const text = await res.text().catch(() => "");
+    throw new Error(`Todoist Sync ${res.status}: ${text || res.statusText}`);
+  }
+  return res.json();
+}
+
+// ─────────────────────────────────────────────
 // Tool definitions  (ordered by usage frequency)
 // ─────────────────────────────────────────────
 const TOOLS = [
@@ -559,7 +589,7 @@ const TOOLS = [
       "Filter by section (name), section_id, label, filter, or ids[]. " +
       "section: resolve by name (e.g. 'ワクチン接種'). " +
       "compact (default true) returns id/section/co/content/labels/due. " +
-      "Default format: tsv. fields: id,section,sid,co,content,labels,due,pid,pri,desc,proj,rec,cat.",
+      "Default format: tsv. fields: id,section,sid,co(=child_order/section position),content,labels,due,pid,pri,desc,proj,rec,cat.",
     inputSchema: {
       type: "object",
       properties: {
@@ -1450,6 +1480,9 @@ async function runTool(env, name, args) {
       const ops = args.operations ?? [];
       if (!ops.length) return { error: "No operations provided" };
 
+      // Collect reorder items from all update ops; executed as a single Sync API call after REST ops.
+      const reorderItems = [];
+
       // Execute a single operation, reusing existing handler logic
       const execOp = async (op, idx) => {
         try {
@@ -1466,7 +1499,12 @@ async function runTool(env, name, args) {
               if (op.parent_id !== undefined) body.parent_id = (op.parent_id === "" || op.parent_id === "none") ? null : op.parent_id;
               if (op.due_date)    body.due_date = evalDate(op.due_date);
               if (op.due_string)  body.due_string = op.due_string;
-              await todoistReq(tt, "POST", `/tasks/${op.task_id}`, body);
+              // order is handled via Sync API after all REST ops complete
+              if (op.order !== undefined) reorderItems.push({ id: op.task_id, child_order: op.order });
+              // Only call REST if there are non-order fields to update
+              if (Object.keys(body).length > 0) {
+                await todoistReq(tt, "POST", `/tasks/${op.task_id}`, body);
+              }
               return { idx, action: "update", task_id: op.task_id, ok: true };
             }
             case "close": {
@@ -1508,9 +1546,31 @@ async function runTool(env, name, args) {
         const batch = ops.slice(i, i + 3).map((op, j) => execOp(op, i + j));
         results.push(...await Promise.all(batch));
       }
+
+      // Batch-execute all reorders in a single Sync API call
+      if (reorderItems.length > 0) {
+        try {
+          await todoistSync(tt, [{
+            type: "item_reorder",
+            uuid: crypto.randomUUID(),
+            args: { items: reorderItems },
+          }]);
+        } catch (e) {
+          // Mark affected results as failed
+          for (const item of reorderItems) {
+            const r = results.find(r => r.task_id === item.id);
+            if (r) { r.ok = false; r.error = `Reorder failed: ${e.message}`; }
+          }
+        }
+      }
+
       const succeeded = results.filter(r => r.ok).length;
       const failed = results.filter(r => !r.ok).length;
-      return { total: ops.length, succeeded, failed, results };
+      return {
+        total: ops.length, succeeded, failed,
+        ...(failed > 0 && { partial_failure: true }),
+        results,
+      };
     }
 
     case "context": {
@@ -1538,8 +1598,13 @@ async function runTool(env, name, args) {
             let text = "";
             if (c?.rich_text) text = extractText(c.rich_text);
             if (c?.title)     text = extractText(c.title);
+            if (!text.trim()) return null;
+            // Add lightweight heading markers so Claude can identify sections
+            if (b.type === "heading_1") return `\n## ${text}`;
+            if (b.type === "heading_2") return `\n### ${text}`;
+            if (b.type === "heading_3") return `#### ${text}`;
             return text;
-          }).filter(t => t.length > 0).join("\n");
+          }).filter(Boolean).join("\n");
         })(),
       ]);
 
@@ -1598,7 +1663,7 @@ async function handleMCP(request, url, env) {
         result = {
           protocolVersion: MCP_VERSION,
           capabilities: { tools: {} },
-          serverInfo: { name: "notion-todoist-mcp", version: "1.6.0" },
+          serverInfo: { name: "notion-todoist-mcp", version: "1.7.0" },
         };
         break;
 

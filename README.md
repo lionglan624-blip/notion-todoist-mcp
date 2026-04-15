@@ -1,30 +1,29 @@
 # notion-todoist-mcp
 
-A custom [MCP (Model Context Protocol)](https://modelcontextprotocol.io/) server running on Cloudflare Workers that provides Claude with full read/write access to Notion and Todoist.
+A custom [MCP (Model Context Protocol)](https://modelcontextprotocol.io/) server running on Cloudflare Workers that provides Claude with full read/write access to Notion and Todoist. Protected by OAuth 2.1 for use with remote MCP clients.
 
-## Features
+## Features (32 tools)
 
-### Todoist (14 tools)
+### Todoist (18 tools)
 
 | Tool | Description |
 |------|-------------|
-| `t_get_tasks` | Query tasks by project, section (name), label, filter, or IDs. Compact TSV output by default |
+| `t_get_tasks` | Query tasks by project, section (name), section_id, label, filter, or IDs. Compact TSV output by default |
+| `t_get_task` | Get a single task by ID |
 | `t_create_task` | Create a task with labels, due date, priority, section, subtask support |
-| `t_update_task` | Update any task field including move between projects/sections |
+| `t_update_task` | Update any task field including move between projects/sections and reorder within a section |
 | `t_close_task` | Mark a task as completed |
-| `t_delete_task` | Permanently delete a task |
 | `t_reopen_task` | Reopen a completed task |
-| `t_bulk` | Execute multiple operations (create/update/close/delete) in one call with concurrency control |
+| `t_delete_task` | Permanently delete a task |
+| `t_bulk` | Execute multiple operations (create/update/close/delete) in one call with concurrency control; reorders batched via Sync API |
 | `t_get_completed_tasks` | Query completed tasks with date range filtering |
 | `t_get_projects` | List all projects |
-| `t_create_project` | Create a new project |
-| `t_update_project` | Update project name/color/favorite |
-| `t_delete_project` | Delete a project |
+| `t_create_project` / `t_update_project` / `t_delete_project` | Manage projects |
 | `t_get_sections` | List sections in a project |
 | `t_create_section` / `t_update_section` / `t_delete_section` | Manage sections |
 | `t_get_labels` | List all personal labels |
 
-### Notion (7 tools)
+### Notion (9 tools)
 
 | Tool | Description |
 |------|-------------|
@@ -32,19 +31,21 @@ A custom [MCP (Model Context Protocol)](https://modelcontextprotocol.io/) server
 | `n_create_page` | Create a page with property shorthand and Markdown body |
 | `n_update_page` | Update properties, replace or append page body content |
 | `n_get_page` | Get a single page with all properties |
-| `n_get_blocks` | Get page body as plain text blocks |
+| `n_get_blocks` | Get page body as plain text with heading markers (`##`/`###`/`####`) |
 | `n_get_schema` | Get database property schema |
 | `n_search` | Search workspace by title |
 | `n_create_database` | Create a new database under a parent page |
 | `n_update_schema` | Add/remove columns or rename a database |
 
-### Utilities (3 tools)
+### Utilities (5 tools)
 
 | Tool | Description |
 |------|-------------|
 | `eval_date` | Resolve JST date expressions (`today`, `today+7d`, `yesterday`, `today-2w`, `now`, etc.) |
 | `calculate` | Safe math evaluator with `Math.*` support (no `eval`) |
 | `stats` | Compute statistics (count, sum, avg, min, max, median, delta) from a number array |
+| `context` | Fetch combined context (Notion page + Todoist tasks) in one call |
+| `help` | Return static workspace config (pre-configured database/project IDs) |
 
 ## Key Design Choices
 
@@ -52,8 +53,9 @@ A custom [MCP (Model Context Protocol)](https://modelcontextprotocol.io/) server
 - **Date expressions** — `today`, `today+7d`, `today-30d`, `tomorrow`, `today+1m`, `now` etc. are resolved in JST
 - **Property shorthand** — `"text"` becomes `rich_text`, `123` becomes `number`, `true` becomes `checkbox`, `["a","b"]` becomes `multi_select`
 - **Markdown body** — Page content accepts Markdown (headings, bullets, numbered lists, code blocks, bold/italic/code inline)
-- **Rate limit handling** — Both Notion and Todoist requests auto-retry on 429 with exponential backoff
-- **Bulk operations** — `t_bulk` runs up to 3 concurrent operations to stay within rate limits
+- **Rate limit handling** — Notion, Todoist REST, and Todoist Sync requests auto-retry on 429 with exponential backoff
+- **Bulk operations** — `t_bulk` runs up to 3 concurrent operations and batches reorders into a single Sync API call
+- **OAuth 2.1** — `/mcp` endpoint is protected; dynamic client registration + PKCE supported
 
 ## Setup
 
@@ -83,7 +85,7 @@ npx wrangler secret put TODOIST_TOKEN   # Todoist API token
 
 ### 5. Register as MCP server
 
-Add to your Claude Desktop / Claude Code MCP config:
+Add to your Claude Desktop / Claude Code MCP config. The client will perform OAuth discovery automatically:
 
 ```json
 {
@@ -100,8 +102,13 @@ Add to your Claude Desktop / Claude Code MCP config:
 
 | Path | Method | Description |
 |------|--------|-------------|
-| `/mcp` or `/` | POST | MCP JSON-RPC endpoint |
+| `/mcp` or `/` | POST | MCP JSON-RPC endpoint (OAuth-protected) |
 | `/health` | GET | Health check (returns tool count) |
+| `/.well-known/oauth-protected-resource` | GET | OAuth 2.0 protected resource metadata |
+| `/.well-known/oauth-authorization-server` | GET | OAuth 2.0 authorization server metadata |
+| `/register` | POST | Dynamic client registration (RFC 7591) |
+| `/authorize` | GET/POST | Authorization endpoint (PKCE) |
+| `/token` | POST | Token endpoint |
 
 ## Customization
 

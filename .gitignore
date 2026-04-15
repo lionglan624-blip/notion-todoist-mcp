@@ -1,3 +1,4 @@
 .wrangler/
 node_modules/
 build.bat
+push.bat
