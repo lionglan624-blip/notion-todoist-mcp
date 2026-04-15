@@ -134,6 +134,20 @@ The `help` and `context` tools read workspace-specific IDs from two JSON-valued 
 
 Set them in `wrangler.toml` (`[vars]`) or via `npx wrangler secret put` if you prefer to keep IDs out of source control. `context` requires both `TODOIST_CONFIG.inbox_project_id` and `NOTION_DB_IDS.habits_page`.
 
+## Project structure
+
+```
+worker.js          # fetch entry + route dispatch
+src/utils.js       # date expressions, safeMath, id normalizer
+src/notion.js      # Notion REST client, Markdown→blocks, property shorthand
+src/todoist.js     # Todoist REST + Sync clients, compact/TSV helpers
+src/oauth.js       # OAuth 2.1 (HMAC tokens, PKCE, /authorize, /token)
+src/tools.js       # MCP tool schemas (TOOLS array)
+src/mcp.js         # tool handlers + JSON-RPC dispatcher
+```
+
+Wrangler bundles the ESM imports at deploy time — no build step is required.
+
 ## License
 
 MIT
