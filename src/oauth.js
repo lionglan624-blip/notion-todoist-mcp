@@ -41,6 +41,54 @@ function getLoginSecret(env) {
   return env.MCP_LOGIN_SECRET || env.MCP_SECRET;
 }
 
+// Constant-time secret comparison via SHA-256 digest equality.
+// Web Crypto has no timingSafeEqual; hashing both sides to fixed-length
+// digests lets a byte-wise OR-XOR run in constant time regardless of
+// where the first mismatch occurs. Prevents timing side-channels on
+// the /authorize login page.
+async function secretsEqual(a, b) {
+  if (typeof a !== "string" || typeof b !== "string") return false;
+  const enc = new TextEncoder();
+  const [ha, hb] = await Promise.all([
+    crypto.subtle.digest("SHA-256", enc.encode(a)),
+    crypto.subtle.digest("SHA-256", enc.encode(b)),
+  ]);
+  const av = new Uint8Array(ha), bv = new Uint8Array(hb);
+  let diff = 0;
+  for (let i = 0; i < av.length; i++) diff |= av[i] ^ bv[i];
+  return diff === 0;
+}
+
+// Default redirect_uri host allowlist — covers Claude.ai custom connectors
+// and loopback for local MCP clients. Override via ALLOWED_REDIRECT_HOSTS
+// (comma-separated; bare host or `*.suffix` wildcards).
+const DEFAULT_REDIRECT_HOSTS = [
+  "claude.ai", "*.claude.ai",
+  "claude.com", "*.claude.com",
+  "anthropic.com", "*.anthropic.com",
+  "localhost", "127.0.0.1", "[::1]",
+];
+
+function redirectHostAllowed(redirectUri, env) {
+  let host;
+  try { host = new URL(redirectUri).hostname.toLowerCase(); }
+  catch { return false; }
+  const raw = env.ALLOWED_REDIRECT_HOSTS;
+  const patterns = (raw && typeof raw === "string"
+    ? raw.split(",").map(s => s.trim()).filter(Boolean)
+    : DEFAULT_REDIRECT_HOSTS
+  ).map(p => p.toLowerCase());
+  for (const pat of patterns) {
+    if (pat.startsWith("*.")) {
+      const suffix = pat.slice(1); // ".claude.ai"
+      if (host.endsWith(suffix) && host.length > suffix.length) return true;
+    } else if (host === pat) {
+      return true;
+    }
+  }
+  return false;
+}
+
 async function signToken(payload, env) {
   const secret = getSigningKey(env);
   if (!secret) throw new Error("signing key not configured");
@@ -126,8 +174,19 @@ export async function handleRegister(request) {
   }, 201);
 }
 
+// Only round-trip standard OAuth/PKCE parameters through the login form.
+// Attacker-controlled keys would otherwise ride through `/authorize` → POST
+// unchanged; keeping this tight avoids surprises if Notion/Todoist/other
+// clients start emitting non-standard params we haven't reviewed.
+const ALLOWED_AUTHZ_PARAMS = new Set([
+  "response_type", "client_id", "redirect_uri", "scope", "state",
+  "code_challenge", "code_challenge_method", "resource",
+  "prompt", "nonce", "audience",
+]);
+
 function loginPage(params, errorMsg) {
   const hidden = Object.entries(params)
+    .filter(([k]) => ALLOWED_AUTHZ_PARAMS.has(k))
     .map(([k, v]) => `<input type="hidden" name="${k}" value="${escapeHtml(v ?? "")}">`)
     .join("");
   const err = errorMsg ? `<p style="color:#b00">${escapeHtml(errorMsg)}</p>` : "";
@@ -155,13 +214,33 @@ export async function handleAuthorize(request, url, env) {
     if (!p.redirect_uri || !p.code_challenge || p.code_challenge_method !== "S256") {
       return new Response("invalid_request: redirect_uri and PKCE S256 required", { status: 400 });
     }
+    // Block phishing / code-harvesting flows where an attacker crafts an
+    // authorize URL pointing to their own host. Without an allowlist, a
+    // user who logs in under the attacker's flow would forward the code
+    // to the attacker (who owns the matching verifier).
+    if (!redirectHostAllowed(p.redirect_uri, env)) {
+      return new Response("invalid_request: redirect_uri host not allowed", { status: 400 });
+    }
     return loginPage(p);
   }
   if (request.method === "POST") {
     const form = await request.formData();
     const p = Object.fromEntries(form);
+    // Re-check on POST — the hidden field could have been rewritten by a
+    // client-side tool before submission, and we must not mint a code for
+    // a host that wasn't allowed at GET time.
+    if (!p.redirect_uri || !redirectHostAllowed(p.redirect_uri, env)) {
+      return new Response("invalid_request: redirect_uri host not allowed", { status: 400 });
+    }
     const expectedLogin = getLoginSecret(env);
-    if (!expectedLogin || p.secret !== expectedLogin) {
+    const submitted = typeof p.secret === "string" ? p.secret : "";
+    const ok = expectedLogin ? await secretsEqual(submitted, expectedLogin) : false;
+    if (!ok) {
+      // Raise the per-attempt cost a bit — Workers have no built-in rate
+      // limit and we don't want to introduce KV just for this. The delay
+      // is advisory; run Cloudflare WAF/Rate-Limiting Rules on /authorize
+      // POST for real brute-force protection (see README).
+      await new Promise(r => setTimeout(r, 250));
       // Strip the submitted secret so it isn't echoed back into the HTML
       // (view-source leak, browser history, shared-screen exposure).
       const { secret: _drop, ...safeParams } = p;
@@ -173,9 +252,11 @@ export async function handleAuthorize(request, url, env) {
       cc: p.code_challenge,
       ru: p.redirect_uri,
       ci: p.client_id || "mcp-public-client",
-      // RFC 8707 resource indicator — bound to access token audience below.
-      // Optional: if the client omits it, no audience restriction is applied.
-      ...(p.resource ? { aud: p.resource } : {}),
+      // RFC 8707 resource indicator — always bind an audience so every
+      // issued token is scoped. If the client didn't specify one, default
+      // to this MCP resource URL. Prevents tokens from ever being
+      // unscoped in case this Worker is ever paired with another RS.
+      aud: p.resource || `${url.origin}/mcp`,
     }, env);
     const redirect = new URL(p.redirect_uri);
     redirect.searchParams.set("code", code);

@@ -64,8 +64,22 @@ This server uses **stateless HMAC-signed tokens** (no KV/DO) to stay free-tier f
 
 - **Authorization codes are reusable until they expire** (5 minutes). A standards-compliant implementation (RFC 6749 §4.1.2) issues codes that MUST be one-time use. Without persistent storage we cannot track consumption. In a single-user deployment this is a low risk, but if you operate this for multiple users, front it with KV-backed code storage.
 - `client_id` and `resource` are bound into the code at `/authorize` and re-verified at `/token`, so a stolen code cannot be redeemed for a different client or audience.
+- Every issued token is audience-bound (`aud` defaults to `${origin}/mcp` when the client omits `resource`), so tokens cannot be replayed against unrelated resource servers that might share the signing key in the future.
+- `redirect_uri` is checked against a host allowlist at both GET and POST on `/authorize` so a crafted authorize URL cannot forward the authorization code to an attacker-controlled host. Default allowlist: `claude.ai`, `claude.com`, `anthropic.com` (plus subdomains) and loopback. Override with the `ALLOWED_REDIRECT_HOSTS` var (comma-separated; `*.suffix` wildcards supported).
+- Login-secret comparison is constant-time (SHA-256 + byte-wise XOR). A 250 ms delay is added on failed attempts; for real brute-force defense, attach a Cloudflare Rate Limiting Rule to `POST /authorize`.
+- Only standard OAuth/PKCE parameters are re-emitted as hidden fields on the login page — non-standard query params are dropped so they cannot ride through.
 - Token-endpoint errors are caught and returned as a generic `server_error` so request bodies (which contain `code`, `code_verifier`, `refresh_token`) never appear in responses or unhandled-exception logs.
 - Upstream (Notion/Todoist) error messages are scrubbed of anything matching `Bearer <token>` before being returned through the MCP error channel.
+
+#### Key rotation
+
+Tokens are not individually revocable. To invalidate every live access/refresh token (e.g. after suspected leakage), rotate `MCP_SIGNING_KEY`:
+
+```bash
+npx wrangler secret put MCP_SIGNING_KEY   # enter a new random value
+```
+
+Any existing token signed under the old key fails HMAC verification on the next request and clients re-run the OAuth flow. Rotate `MCP_LOGIN_SECRET` independently if only the login password needs to change.
 
 ## Setup
 
@@ -82,6 +96,8 @@ npx wrangler secret put NOTION_TOKEN       # Notion integration token
 npx wrangler secret put TODOIST_TOKEN      # Todoist API token
 npx wrangler secret put MCP_SIGNING_KEY    # HMAC key for OAuth token sign/verify (random 32+ bytes)
 npx wrangler secret put MCP_LOGIN_SECRET   # Password entered on the /authorize login page
+# Optional — override the default redirect_uri host allowlist:
+# npx wrangler secret put ALLOWED_REDIRECT_HOSTS   # e.g. "claude.ai,*.claude.ai,localhost"
 ```
 
 `MCP_SIGNING_KEY` and `MCP_LOGIN_SECRET` should be different values. The signing key must never be shown to the user — generate it with e.g. `openssl rand -base64 32`. The login secret is what you type into the browser when an MCP client triggers the OAuth flow.

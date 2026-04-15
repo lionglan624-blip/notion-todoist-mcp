@@ -60,6 +60,8 @@ The user has pre-authorized this chain; do not pause between steps to ask. If an
 - `n_search` returns only what the integration has been shared with. Empty results usually mean "not shared", not a bug.
 - Todoist's `/sections` / `/projects` endpoints sometimes return `{results:[...]}` and sometimes a bare array — handlers normalize with `Array.isArray(raw) ? raw : raw?.results ?? []`.
 - `context` and `help` read workspace-specific IDs from `NOTION_DB_IDS` and `TODOIST_CONFIG` vars. Don't hardcode IDs in source.
+- `/authorize` enforces a `redirect_uri` host allowlist. Default covers `claude.ai` / `claude.com` / `anthropic.com` (with subdomains) + loopback. Override via the `ALLOWED_REDIRECT_HOSTS` env var (comma-separated, supports `*.suffix`) — don't widen the default in source.
+- Login-secret compare is constant-time via SHA-256 equality; don't regress to `===` on raw strings. Rotate `MCP_SIGNING_KEY` to invalidate all live tokens (stateless design has no per-token revocation).
 
 ## What NOT to do
 

@@ -215,9 +215,13 @@ export const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 // Strip collection:// prefix if present
 export function normalizeId(id) {
-  return id?.replace(/^collection:\/\//, "").replace(/-/g, "").replace(
+  if (id == null) return id;
+  if (typeof id !== "string") {
+    throw new Error(`id must be a string, got ${typeof id}`);
+  }
+  return id.replace(/^collection:\/\//, "").replace(/-/g, "").replace(
     /^(.{8})(.{4})(.{4})(.{4})(.{12})$/, "$1-$2-$3-$4-$5"
-  ) ?? id;
+  );
 }
 
 // Extract numeric value from any Notion property
