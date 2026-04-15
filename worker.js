@@ -18,8 +18,6 @@ import {
   handleAuthorize,
   handleToken,
 } from "./src/oauth.js";
-import { runDailyNextLabels } from "./src/cron.js";
-import { handleTodoistWebhook } from "./src/webhook.js";
 
 export default {
   async fetch(request, env) {
@@ -40,8 +38,6 @@ export default {
     if (p === "/authorize") return handleAuthorize(request, url, env);
     if (p === "/token") return handleToken(request, env);
 
-    if (p === "/webhook/todoist") return handleTodoistWebhook(request, env);
-
     if (p === "/" || p === "/mcp") {
       return handleMCP(request, url, env);
     }
@@ -51,9 +47,5 @@ export default {
     }
 
     return new Response("Notion + Todoist MCP Server", { status: 200 });
-  },
-
-  async scheduled(event, env, ctx) {
-    ctx.waitUntil(runDailyNextLabels(env));
   },
 };
