@@ -107,33 +107,15 @@ npx wrangler deploy
 ### 3. Set secrets
 
 ```bash
-npx wrangler secret put NOTION_TOKEN             # Notion integration token
-npx wrangler secret put TODOIST_TOKEN            # Todoist API token (also used by the cron + webhook)
-npx wrangler secret put MCP_LOGIN_SECRET         # Password you'll type on /authorize
-
-# Pipe a random 32-char HMAC key straight in — never display it on screen:
-openssl rand -base64 24 | tr -d '\n' | npx wrangler secret put MCP_SIGNING_KEY
-# Node fallback if openssl isn't on PATH:
-# node -e "process.stdout.write(require('crypto').randomBytes(24).toString('base64'))" | npx wrangler secret put MCP_SIGNING_KEY
-
-# Only needed if you enable the Todoist webhook (see § Automation in CLAUDE.md):
-npx wrangler secret put TODOIST_WEBHOOK_SECRET   # Todoist app client_secret
-
+npx wrangler secret put NOTION_TOKEN       # Notion integration token
+npx wrangler secret put TODOIST_TOKEN      # Todoist API token
+npx wrangler secret put MCP_SIGNING_KEY    # HMAC key for OAuth token sign/verify (random 32+ bytes)
+npx wrangler secret put MCP_LOGIN_SECRET   # Password entered on the /authorize login page
 # Optional — override the default redirect_uri host allowlist:
 # npx wrangler secret put ALLOWED_REDIRECT_HOSTS   # e.g. "claude.ai,*.claude.ai,localhost"
 ```
 
-#### Which secrets you need to retain
-
-| Secret | Retain locally? | Why |
-|--------|-----------------|-----|
-| `NOTION_TOKEN` | No | Always visible in the Notion integration settings page |
-| `TODOIST_TOKEN` | No | Always visible in Todoist → Settings → Integrations → Developer |
-| `TODOIST_WEBHOOK_SECRET` | No | Always visible in the Todoist Developer Console as the app's `client_secret` |
-| `MCP_SIGNING_KEY` | **No — disposable by design** | Throwaway random string. Rotating / regenerating it is the intentional revocation path: all live OAuth tokens fail verification and clients re-auth once via `/authorize`. There is nothing to back up |
-| `MCP_LOGIN_SECRET` | **Yes** | The password you type on `/authorize`. Forgetting it means you can no longer issue new OAuth tokens (existing tokens keep working until `MCP_SIGNING_KEY` rotates) |
-
-So the random-pipe pattern above for `MCP_SIGNING_KEY` is deliberate — not seeing the value on screen is fine because you never need to see it again. For `MCP_LOGIN_SECRET`, use the interactive `wrangler secret put` prompt (or your password manager) since you'll have to type it into the browser.
+`MCP_SIGNING_KEY` and `MCP_LOGIN_SECRET` should be different values. The signing key must never be shown to the user — generate it with e.g. `openssl rand -base64 32`. The login secret is what you type into the browser when an MCP client triggers the OAuth flow.
 
 Legacy deployments that set a single `MCP_SECRET` still work: both roles fall back to it when the split secrets are absent. New deployments should prefer the split form.
 
@@ -174,7 +156,6 @@ Add to your Claude Desktop / Claude Code MCP config. The client will perform OAu
 | `/register` | POST | Dynamic client registration (RFC 7591) |
 | `/authorize` | GET/POST | Authorization endpoint (PKCE) |
 | `/token` | POST | Token endpoint |
-| `/webhook/todoist` | POST | Todoist webhook receiver (HMAC-verified). Renumbers `#N` sequential sections on `item:completed`. See CLAUDE.md § Automation |
 
 ## Customization
 
@@ -188,15 +169,13 @@ Set them in `wrangler.toml` (`[vars]`) or via `npx wrangler secret put` if you p
 ## Project structure
 
 ```
-worker.js          # fetch entry + route dispatch; also exports `scheduled` for the cron
+worker.js          # fetch entry + route dispatch
 src/utils.js       # date expressions, safeMath, id normalizer
 src/notion.js      # Notion REST client, Markdown→blocks, property shorthand
 src/todoist.js     # Todoist REST + Sync clients, compact/TSV helpers
 src/oauth.js       # OAuth 2.1 (HMAC tokens, PKCE, /authorize, /token)
 src/tools.js       # MCP tool schemas (TOOLS array)
 src/mcp.js         # tool handlers + JSON-RPC dispatcher
-src/cron.js        # daily `next`-label maintenance (runs via [triggers].crons)
-src/webhook.js     # POST /webhook/todoist — sequential (#N) section renumbering
 ```
 
 Wrangler bundles the ESM imports at deploy time — no build step is required.
