@@ -197,6 +197,7 @@ const TOOL_HANDLERS = {
           }
         }
       }
+      if (args.archived !== undefined) body.archived = args.archived;
       const db = await notionReq(nt, "PATCH", `/databases/${id}`, body);
       return { id: db.id, url: db.url, last_edited_time: db.last_edited_time };
   },
@@ -280,13 +281,24 @@ const TOOL_HANDLERS = {
   },
 
   n_search: async (args, { nt }) => {
-      const body = { query: args.query, page_size: args.page_size ?? 10 };
+      // query is optional — Notion accepts an empty query and returns everything
+      // the integration can access, filtered by the object-type filter below.
+      const body = { query: args.query ?? "", page_size: args.page_size ?? 10 };
       if (args.type) body.filter = { value: args.type, property: "object" };
       const res = await notionReq(nt, "POST", "/search", body);
+      // Page title lives under whichever property is typed "title" — the key
+      // is not always "title" (often "Name" or a localized label), so scan.
+      const extractPageTitle = (props) => {
+        if (!props) return null;
+        for (const v of Object.values(props)) {
+          if (v?.type === "title") return v.title?.map(t => t.plain_text).join("") || null;
+        }
+        return null;
+      };
       return {
         results: res.results.map(r => ({
           id: r.id, type: r.object, url: r.url,
-          title: r.title?.[0]?.plain_text ?? r.properties?.title?.title?.[0]?.plain_text ?? "(untitled)",
+          title: r.title?.map(t => t.plain_text).join("") || extractPageTitle(r.properties) || "(untitled)",
           last_edited_time: r.last_edited_time,
         })),
         has_more: res.has_more,

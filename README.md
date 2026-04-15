@@ -33,9 +33,9 @@ A custom [MCP (Model Context Protocol)](https://modelcontextprotocol.io/) server
 | `n_get_page` | Get a single page with all properties |
 | `n_get_blocks` | Get page body as plain text with heading markers (`##`/`###`/`####`) |
 | `n_get_schema` | Get database property schema |
-| `n_search` | Search workspace by title |
+| `n_search` | Search workspace by title. `query` is optional — omit with `type:"database"` or `type:"page"` to list everything the integration can access (useful for finding a `parent_page_id` before `n_create_database`) |
 | `n_create_database` | Create a new database under a parent page |
-| `n_update_schema` | Add/remove columns or rename a database |
+| `n_update_schema` | Add/remove columns, rename, or archive (`archived:true`) a database |
 
 ### Utilities (5 tools)
 

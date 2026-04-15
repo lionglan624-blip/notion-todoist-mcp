@@ -287,15 +287,17 @@ export const TOOLS = [
   },
   {
     name: "n_search",
-    description: "Search Notion workspace by title.",
+    description:
+      "Search Notion workspace by title. " +
+      "query is optional — omit (or pass empty string) with type:\"database\" to list all databases the integration can access, " +
+      "or with type:\"page\" to list all accessible top-level pages (useful for finding a parent_page_id before n_create_database).",
     inputSchema: {
       type: "object",
       properties: {
-        query: { type: "string" },
+        query: { type: "string", description: "Title substring; omit to list everything accessible" },
         type: { type: "string", enum: ["page", "database"] },
         page_size: { type: "number", default: 10 },
       },
-      required: ["query"],
     },
   },
 
@@ -403,7 +405,11 @@ export const TOOLS = [
   },
   {
     name: "n_update_schema",
-    description: "Add/remove columns or rename a Notion database. add: {col: schema}, remove: [colNames].",
+    description:
+      "Add/remove columns, rename, or archive a Notion database. " +
+      "add: {col: schema}, remove: [colNames]. " +
+      "archived:true moves the database to trash (archived:false restores). " +
+      "Use this for cleanup of databases created via n_create_database.",
     inputSchema: {
       type: "object",
       properties: {
@@ -411,6 +417,7 @@ export const TOOLS = [
         add: { type: "object" },
         remove: { type: "array", items: { type: "string" } },
         title: { type: "string", description: "Rename the database" },
+        archived: { type: "boolean", description: "true = move DB to trash, false = restore" },
       },
       required: ["database_id"],
     },
