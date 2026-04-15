@@ -45,7 +45,7 @@ A custom [MCP (Model Context Protocol)](https://modelcontextprotocol.io/) server
 | `calculate` | Safe math evaluator with `Math.*` support (no `eval`) |
 | `stats` | Compute statistics (count, sum, avg, min, max, median, delta) from a number array |
 | `context` | Fetch combined context (Notion page + Todoist tasks) in one call |
-| `help` | Return static workspace config (pre-configured database/project IDs) |
+| `help` | Return the full tool list (names + inputSchemas) plus static workspace config (pre-configured database/project IDs) |
 
 ## Key Design Choices
 

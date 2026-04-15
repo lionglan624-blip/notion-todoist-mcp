@@ -1975,7 +1975,10 @@ async function handleAuthorize(request, url, env) {
     const p = Object.fromEntries(form);
     const expectedLogin = getLoginSecret(env);
     if (!expectedLogin || p.secret !== expectedLogin) {
-      return loginPage(p, "Invalid secret");
+      // Strip the submitted secret so it isn't echoed back into the HTML
+      // (view-source leak, browser history, shared-screen exposure).
+      const { secret: _drop, ...safeParams } = p;
+      return loginPage(safeParams, "Invalid secret");
     }
     const code = await signToken({
       typ: "code",
