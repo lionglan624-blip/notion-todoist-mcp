@@ -28,7 +28,11 @@ export async function notionReq(token, method, path, body, _attempt = 0) {
 
   if (!res.ok) {
     const e = await res.json().catch(() => ({}));
-    throw new Error(`Notion ${res.status}: ${e.message || res.statusText}`);
+    // Truncate upstream message before surfacing — Notion echoes back parts
+    // of request bodies in validation errors, and unbounded passthrough is
+    // a slow leak of caller data into MCP error frames.
+    const raw = typeof e.message === "string" && e.message ? e.message : res.statusText;
+    throw new Error(`Notion ${res.status}: ${String(raw).slice(0, 200)}`);
   }
   return res.json();
 }

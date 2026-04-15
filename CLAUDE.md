@@ -62,6 +62,10 @@ The user has pre-authorized this chain; do not pause between steps to ask. If an
 - `context` and `help` read workspace-specific IDs from `NOTION_DB_IDS` and `TODOIST_CONFIG` vars. Don't hardcode IDs in source.
 - `/authorize` enforces a `redirect_uri` host allowlist. Default covers `claude.ai` / `claude.com` / `anthropic.com` (with subdomains) + loopback. Override via the `ALLOWED_REDIRECT_HOSTS` env var (comma-separated, supports `*.suffix`) — don't widen the default in source.
 - Login-secret compare is constant-time via SHA-256 equality; don't regress to `===` on raw strings. Rotate `MCP_SIGNING_KEY` to invalidate all live tokens (stateless design has no per-token revocation).
+- **OAuth stateless tradeoffs (accepted)**: authorization codes are *not* one-time-use (RFC 6749 §4.1.2 violation) and refresh tokens do *not* rotate (RFC 6749 §10.4). Both require persistent state to fix and we deliberately avoid KV/DO. Mitigations: codes have a 5-min TTL and are PKCE-bound; refresh tokens are 30-day, audience-bound, and scoped to a single user. If single-user assumption changes, revisit by introducing KV-backed code+refresh tracking.
+- **Todoist IDs go through `assertTodoistId`** before any URL interpolation (and ideally before any body use too). Notion IDs go through `normalizeId`, which now *throws* on non-UUID input. Both block path-pivot attacks (e.g. `task_id:"123/close"` turning an update into a close). Don't bypass — every new handler that takes a user-supplied ID must validate it.
+- **`/authorize` POST checks the `Origin` header** — same-origin or absent only. Browser-form CSRF (autofill / password-manager exploit) is blocked here; absent-Origin (curl/server) is allowed for ops use.
+- **Upstream error messages are truncated to 200 chars** in `notionReq` / `todoistReq` before being thrown. Don't widen — Notion/Todoist echo request bodies in validation errors and unbounded passthrough leaks caller data into MCP error frames.
 
 ## What NOT to do
 

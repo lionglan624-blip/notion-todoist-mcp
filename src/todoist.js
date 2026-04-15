@@ -104,7 +104,10 @@ export async function todoistReq(token, method, path, body, _attempt = 0) {
 
   if (!res.ok) {
     const text = await res.text().catch(() => "");
-    throw new Error(`Todoist ${res.status}: ${text || res.statusText}`);
+    // Truncate to bound any echo of caller-supplied content in the response
+    // body before it reaches the MCP error channel.
+    const msg = (text || res.statusText || "").slice(0, 200);
+    throw new Error(`Todoist ${res.status}: ${msg}`);
   }
   if (res.status === 204) return null;
   return res.json();
@@ -138,7 +141,8 @@ export async function todoistSync(token, commands, _attempt = 0) {
   }
   if (!res.ok) {
     const text = await res.text().catch(() => "");
-    throw new Error(`Todoist Sync ${res.status}: ${text || res.statusText}`);
+    const msg = (text || res.statusText || "").slice(0, 200);
+    throw new Error(`Todoist Sync ${res.status}: ${msg}`);
   }
   return res.json();
 }

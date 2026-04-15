@@ -1,4 +1,4 @@
-import { evalDate, resolveFilterDates, safeMath, sleep, normalizeId, extractNum } from "./utils.js";
+import { evalDate, resolveFilterDates, safeMath, sleep, normalizeId, extractNum, assertTodoistId } from "./utils.js";
 import {
   notionReq, compactProps, appendBlocksChunked, mdToBlocks,
   resolvePropDates, normalizeProperties, NOTION_CHILDREN_BATCH,
@@ -384,6 +384,7 @@ const TOOL_HANDLERS = {
 
   t_get_sections: async (args, { tt }) => {
       const crossProject = !args.project_id || args.project_id === "all";
+      if (!crossProject) assertTodoistId(args.project_id, "project_id");
       const path = crossProject ? "/sections" : `/sections?project_id=${args.project_id}`;
       const raw = await todoistReq(tt, "GET", path);
       const items = Array.isArray(raw) ? raw : (raw?.results ?? []);
@@ -396,6 +397,7 @@ const TOOL_HANDLERS = {
   },
 
   t_create_section: async (args, { tt }) => {
+    assertTodoistId(args.project_id, "project_id");
     const body = { name: args.name, project_id: args.project_id };
     if (args.order !== undefined) body.order = args.order;
     return todoistReq(tt, "POST", "/sections", body);
@@ -412,6 +414,7 @@ const TOOL_HANDLERS = {
 
   t_update_project: async (args, { tt }) => {
       const { project_id, ...rest } = args;
+      assertTodoistId(project_id, "project_id");
       const body = {};
       if (rest.name)        body.name = rest.name;
       if (rest.color)       body.color = rest.color;
@@ -420,19 +423,24 @@ const TOOL_HANDLERS = {
   },
 
   t_delete_project: async (args, { tt }) => {
+    assertTodoistId(args.project_id, "project_id");
     await todoistReq(tt, "DELETE", `/projects/${args.project_id}`);
     return { success: true, project_id: args.project_id };
   },
 
-  t_update_section: async (args, { tt }) =>
-    todoistReq(tt, "POST", `/sections/${args.section_id}`, { name: args.name }),
+  t_update_section: async (args, { tt }) => {
+    assertTodoistId(args.section_id, "section_id");
+    return todoistReq(tt, "POST", `/sections/${args.section_id}`, { name: args.name });
+  },
 
   t_delete_section: async (args, { tt }) => {
+    assertTodoistId(args.section_id, "section_id");
     await todoistReq(tt, "DELETE", `/sections/${args.section_id}`);
     return { success: true, section_id: args.section_id };
   },
 
   t_get_task: async (args, { tt }) => {
+      assertTodoistId(args.task_id, "task_id");
       const raw = await todoistReq(tt, "GET", `/tasks/${args.task_id}`);
       if (args.compact === false) return raw;
       // Resolve section name if 'section' field is requested
@@ -453,9 +461,12 @@ const TOOL_HANDLERS = {
       if (!crossProject && !projectId && !args.filter && !args.label && !args.ids?.length) {
         try { projectId = JSON.parse(env.TODOIST_CONFIG).inbox_project_id; } catch {}
       }
+      if (projectId) assertTodoistId(projectId, "project_id");
+      if (args.ids?.length) for (const id of args.ids) assertTodoistId(id, "ids[]");
 
       // Resolve section name → section_id
       let sectionId = args.section_id;
+      if (sectionId) assertTodoistId(sectionId, "section_id");
       let sectionMap = null;
       const needsSectionName = (args.fields || TASK_COMPACT_DEFAULTS).includes("section");
 
@@ -495,6 +506,9 @@ const TOOL_HANDLERS = {
   },
 
   t_create_task: async (args, { tt }) => {
+      if (args.project_id) assertTodoistId(args.project_id, "project_id");
+      if (args.section_id) assertTodoistId(args.section_id, "section_id");
+      if (args.parent_id)  assertTodoistId(args.parent_id, "parent_id");
       const body = { content: args.content };
       if (args.project_id)  body.project_id = args.project_id;
       if (args.section_id)  body.section_id = args.section_id;
@@ -510,6 +524,12 @@ const TOOL_HANDLERS = {
 
   t_update_task: async (args, { tt }) => {
       const { task_id, ...rest } = args;
+      assertTodoistId(task_id, "task_id");
+      if (rest.section_id) assertTodoistId(rest.section_id, "section_id");
+      if (rest.project_id) assertTodoistId(rest.project_id, "project_id");
+      if (rest.parent_id && rest.parent_id !== "" && rest.parent_id !== "none") {
+        assertTodoistId(rest.parent_id, "parent_id");
+      }
       const body = {};
       if (rest.content)     body.content = rest.content;
       if (rest.labels)      body.labels = rest.labels;
@@ -524,11 +544,13 @@ const TOOL_HANDLERS = {
   },
 
   t_close_task: async (args, { tt }) => {
+    assertTodoistId(args.task_id, "task_id");
     await todoistReq(tt, "POST", `/tasks/${args.task_id}/close`);
     return { success: true, task_id: args.task_id };
   },
 
   t_reopen_task: async (args, { tt }) => {
+    assertTodoistId(args.task_id, "task_id");
     await todoistReq(tt, "POST", `/tasks/${args.task_id}/reopen`);
     return { success: true, task_id: args.task_id };
   },
@@ -543,6 +565,8 @@ const TOOL_HANDLERS = {
       if (!completedPid) {
         try { completedPid = JSON.parse(env.TODOIST_CONFIG).inbox_project_id; } catch {}
       }
+      if (completedPid) assertTodoistId(completedPid, "project_id");
+      if (args.section_id) assertTodoistId(args.section_id, "section_id");
       const params = new URLSearchParams();
       params.set("since", since + "T00:00:00Z");
       params.set("until", until + "T23:59:59Z");
@@ -568,6 +592,7 @@ const TOOL_HANDLERS = {
   },
 
   t_delete_task: async (args, { tt }) => {
+    assertTodoistId(args.task_id, "task_id");
     await todoistReq(tt, "DELETE", `/tasks/${args.task_id}`);
     return { success: true, task_id: args.task_id };
   },
@@ -585,6 +610,12 @@ const TOOL_HANDLERS = {
           switch (op.action) {
             case "update": {
               if (!op.task_id) throw new Error("task_id required for update");
+              assertTodoistId(op.task_id, "task_id");
+              if (op.section_id) assertTodoistId(op.section_id, "section_id");
+              if (op.project_id) assertTodoistId(op.project_id, "project_id");
+              if (op.parent_id && op.parent_id !== "" && op.parent_id !== "none") {
+                assertTodoistId(op.parent_id, "parent_id");
+              }
               const body = {};
               if (op.content)     body.content = op.content;
               if (op.labels)      body.labels = op.labels;
@@ -605,16 +636,21 @@ const TOOL_HANDLERS = {
             }
             case "close": {
               if (!op.task_id) throw new Error("task_id required for close");
+              assertTodoistId(op.task_id, "task_id");
               await todoistReq(tt, "POST", `/tasks/${op.task_id}/close`);
               return { idx, action: "close", task_id: op.task_id, ok: true };
             }
             case "delete": {
               if (!op.task_id) throw new Error("task_id required for delete");
+              assertTodoistId(op.task_id, "task_id");
               await todoistReq(tt, "DELETE", `/tasks/${op.task_id}`);
               return { idx, action: "delete", task_id: op.task_id, ok: true };
             }
             case "create": {
               if (!op.content) throw new Error("content required for create");
+              if (op.project_id) assertTodoistId(op.project_id, "project_id");
+              if (op.section_id) assertTodoistId(op.section_id, "section_id");
+              if (op.parent_id)  assertTodoistId(op.parent_id, "parent_id");
               const body = { content: op.content };
               if (op.project_id)  body.project_id = op.project_id;
               if (op.section_id)  body.section_id = op.section_id;

@@ -213,20 +213,32 @@ export function safeMath(expr) {
 
 export const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-// Strip collection:// prefix and, when the ID is a dash-less Notion UUID,
-// re-insert the canonical dashes. Validating hex-only here prevents
-// non-UUID garbage (e.g. ``zzzz...``) from being silently reshaped into
-// a dashed string that then gets forwarded to the Notion API.
+// Strip collection:// prefix and re-insert canonical UUID dashes.
+// Strict: rejects anything that isn't a 32-hex Notion UUID. Without this,
+// values like "foo/bar" or "../databases/X" would be passed straight into
+// `/blocks/${id}` etc., letting a caller pivot to unintended endpoints.
 export function normalizeId(id) {
   if (id == null) return id;
   if (typeof id !== "string") {
     throw new Error(`id must be a string, got ${typeof id}`);
   }
   const stripped = id.replace(/^collection:\/\//, "").replace(/-/g, "");
-  if (/^[0-9a-f]{32}$/i.test(stripped)) {
-    return stripped.replace(/^(.{8})(.{4})(.{4})(.{4})(.{12})$/, "$1-$2-$3-$4-$5");
+  if (!/^[0-9a-f]{32}$/i.test(stripped)) {
+    throw new Error(`Invalid Notion ID: must be a 32-character hex UUID`);
   }
-  return stripped;
+  return stripped.replace(/^(.{8})(.{4})(.{4})(.{4})(.{12})$/, "$1-$2-$3-$4-$5");
+}
+
+// Todoist IDs are opaque strings (currently numeric, but the v1 API treats
+// them as strings). Restrict to a safe character set so a value like
+// "123/close" can't pivot `POST /tasks/${task_id}` (update) into
+// `POST /tasks/123/close` (close). Also blocks ?, &, #, /, .., etc. that
+// would inject query params or escape the URL path.
+export function assertTodoistId(id, name = "id") {
+  if (typeof id !== "string" || !/^[A-Za-z0-9_-]+$/.test(id)) {
+    throw new Error(`Invalid ${name}: must match [A-Za-z0-9_-]+`);
+  }
+  return id;
 }
 
 // Extract numeric value from any Notion property

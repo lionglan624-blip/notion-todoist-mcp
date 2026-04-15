@@ -227,6 +227,16 @@ export async function handleAuthorize(request, url, env) {
     return loginPage(p);
   }
   if (request.method === "POST") {
+    // CSRF defense: reject cross-origin POSTs. The login form is served
+    // from this Worker, so legitimate browser submissions always carry our
+    // origin. Browsers always send Origin on POST; the absent case (curl,
+    // server-to-server) is allowed so ops/local testing isn't blocked.
+    // Without this, an attacker page could autosubmit a form to /authorize
+    // using a victim's pre-typed secret (autofill / password manager).
+    const reqOrigin = request.headers.get("Origin");
+    if (reqOrigin && reqOrigin !== url.origin) {
+      return new Response("forbidden: cross-origin POST", { status: 403 });
+    }
     const form = await request.formData();
     const p = Object.fromEntries(form);
     // Re-check on POST — the hidden field could have been rewritten by a
