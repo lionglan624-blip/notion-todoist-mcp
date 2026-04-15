@@ -144,29 +144,31 @@ function safeMath(expr) {
     return v;
   }
 
-  // term  = pow   (('*' | '/' | '%') pow)*
+  // term  = unary (('*' | '/' | '%') unary)*
   function parseTerm() {
-    let v = parsePow();
+    let v = parseUnary();
     while (["*", "/", "%"].includes(peek().v)) {
       const op = consume().v;
-      const r = parsePow();
+      const r = parseUnary();
       v = op === "*" ? v * r : op === "/" ? v / r : v % r;
     }
     return v;
   }
 
-  // pow   = unary ('^' unary)?   (right-associative)
-  function parsePow() {
-    const v = parseUnary();
-    if (peek().v === "^") { consume(); return Math.pow(v, parseUnary()); }
-    return v;
-  }
-
-  // unary = ('-' | '+') unary  |  atom
+  // unary = ('-' | '+') unary  |  pow
+  // Lower precedence than '^' so -2^2 === -(2^2) === -4 (standard math convention)
   function parseUnary() {
     if (peek().v === "-") { consume(); return -parseUnary(); }
     if (peek().v === "+") { consume(); return parseUnary(); }
-    return parseAtom();
+    return parsePow();
+  }
+
+  // pow   = atom ('^' unary)?   (right-associative via unary → pow recursion)
+  // 2^3^2 === 2^(3^2) === 512;   2^-3 === 0.125
+  function parsePow() {
+    const v = parseAtom();
+    if (peek().v === "^") { consume(); return Math.pow(v, parseUnary()); }
+    return v;
   }
 
   // atom  = NUMBER | '(' expr ')' | 'Math' '.' IDENT ('(' args ')')?
@@ -1269,8 +1271,16 @@ async function runTool(env, name, args) {
       }
       // 2. replace_content: delete all existing blocks then append new ones
       if (args.replace_content !== undefined) {
-        const existing = await notionReq(nt, "GET", `/blocks/${pid}/children?page_size=100`);
-        for (const blk of existing.results) {
+        // Paginate through all existing children — page_size=100 is the Notion API max
+        const allBlocks = [];
+        let cursor;
+        do {
+          const qs = cursor ? `?page_size=100&start_cursor=${cursor}` : `?page_size=100`;
+          const page = await notionReq(nt, "GET", `/blocks/${pid}/children${qs}`);
+          allBlocks.push(...page.results);
+          cursor = page.has_more ? page.next_cursor : null;
+        } while (cursor);
+        for (const blk of allBlocks) {
           await notionReq(nt, "DELETE", `/blocks/${blk.id}`, undefined).catch(() => {});
         }
         const newBlocks = mdToBlocks(args.replace_content);
@@ -1680,7 +1690,10 @@ async function handleMCP(request, url, env) {
 
       case "tools/call": {
         const toolResult = await runTool(env, params.name, params.arguments ?? {});
-        result = { content: [{ type: "text", text: JSON.stringify(toolResult, null, 2) }] };
+        const text = typeof toolResult === "string"
+          ? toolResult
+          : JSON.stringify(toolResult, null, 2);
+        result = { content: [{ type: "text", text }] };
         break;
       }
 
