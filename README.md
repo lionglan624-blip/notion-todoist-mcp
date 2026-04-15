@@ -68,9 +68,15 @@ npx wrangler deploy
 ### 2. Set secrets
 
 ```bash
-npx wrangler secret put NOTION_TOKEN    # Notion integration token
-npx wrangler secret put TODOIST_TOKEN   # Todoist API token
+npx wrangler secret put NOTION_TOKEN       # Notion integration token
+npx wrangler secret put TODOIST_TOKEN      # Todoist API token
+npx wrangler secret put MCP_SIGNING_KEY    # HMAC key for OAuth token sign/verify (random 32+ bytes)
+npx wrangler secret put MCP_LOGIN_SECRET   # Password entered on the /authorize login page
 ```
+
+`MCP_SIGNING_KEY` and `MCP_LOGIN_SECRET` should be different values. The signing key must never be shown to the user — generate it with e.g. `openssl rand -base64 32`. The login secret is what you type into the browser when an MCP client triggers the OAuth flow.
+
+Legacy deployments that set a single `MCP_SECRET` still work: both roles fall back to it when the split secrets are absent. New deployments should prefer the split form.
 
 ### 3. Notion integration setup
 
