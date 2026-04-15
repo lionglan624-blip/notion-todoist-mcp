@@ -213,15 +213,20 @@ export function safeMath(expr) {
 
 export const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-// Strip collection:// prefix if present
+// Strip collection:// prefix and, when the ID is a dash-less Notion UUID,
+// re-insert the canonical dashes. Validating hex-only here prevents
+// non-UUID garbage (e.g. ``zzzz...``) from being silently reshaped into
+// a dashed string that then gets forwarded to the Notion API.
 export function normalizeId(id) {
   if (id == null) return id;
   if (typeof id !== "string") {
     throw new Error(`id must be a string, got ${typeof id}`);
   }
-  return id.replace(/^collection:\/\//, "").replace(/-/g, "").replace(
-    /^(.{8})(.{4})(.{4})(.{4})(.{12})$/, "$1-$2-$3-$4-$5"
-  );
+  const stripped = id.replace(/^collection:\/\//, "").replace(/-/g, "");
+  if (/^[0-9a-f]{32}$/i.test(stripped)) {
+    return stripped.replace(/^(.{8})(.{4})(.{4})(.{4})(.{12})$/, "$1-$2-$3-$4-$5");
+  }
+  return stripped;
 }
 
 // Extract numeric value from any Notion property

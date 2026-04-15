@@ -127,8 +127,16 @@ export async function appendBlocksChunked(token, parentId, blocks) {
   }
 }
 
+// Guard against accidentally large markdown payloads: Notion itself caps
+// text at 2000 chars/rich_text and 100 blocks/append, but nothing above
+// us caps total input. 2 MB is ~1M chars — well beyond any sane page.
+export const MD_INPUT_LIMIT = 2_000_000;
+
 export function mdToBlocks(md) {
   if (!md) return [];
+  if (md.length > MD_INPUT_LIMIT) {
+    throw new Error(`markdown too large: ${md.length} chars (limit ${MD_INPUT_LIMIT})`);
+  }
   const lines = md.split("\n");
   const blocks = [];
   let i = 0;

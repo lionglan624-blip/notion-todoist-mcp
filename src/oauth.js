@@ -161,13 +161,16 @@ export function handleAuthServerMetadata(url) {
   });
 }
 
-export async function handleRegister(request) {
-  let body = {};
-  try { body = await request.json(); } catch {}
+export async function handleRegister(_request) {
+  // Public dynamic registration (RFC 7591). We intentionally ignore the
+  // client-supplied body: the redirect_uri host allowlist at /authorize
+  // is the sole source of truth, and echoing back `redirect_uris` here
+  // could be mistaken by downstream tooling for server endorsement of
+  // attacker-controlled URIs.
   return oauthJson({
     client_id: "mcp-public-client",
     client_id_issued_at: Math.floor(Date.now() / 1000),
-    redirect_uris: body.redirect_uris ?? [],
+    redirect_uris: [],
     token_endpoint_auth_method: "none",
     grant_types: ["authorization_code", "refresh_token"],
     response_types: ["code"],
@@ -237,10 +240,13 @@ export async function handleAuthorize(request, url, env) {
     const ok = expectedLogin ? await secretsEqual(submitted, expectedLogin) : false;
     if (!ok) {
       // Raise the per-attempt cost a bit — Workers have no built-in rate
-      // limit and we don't want to introduce KV just for this. The delay
-      // is advisory; run Cloudflare WAF/Rate-Limiting Rules on /authorize
-      // POST for real brute-force protection (see README).
-      await new Promise(r => setTimeout(r, 250));
+      // limit and we don't want to introduce KV just for this. Jitter
+      // (200–400ms) frustrates timing-correlation attempts that would
+      // otherwise fingerprint our fixed sleep. The delay is advisory;
+      // run Cloudflare WAF/Rate-Limiting Rules on /authorize POST for
+      // real brute-force protection (see README).
+      const jitterMs = 200 + Math.floor(Math.random() * 200);
+      await new Promise(r => setTimeout(r, jitterMs));
       // Strip the submitted secret so it isn't echoed back into the HTML
       // (view-source leak, browser history, shared-screen exposure).
       const { secret: _drop, ...safeParams } = p;
@@ -269,11 +275,18 @@ export async function handleAuthorize(request, url, env) {
 export async function handleToken(request, env) {
   try {
     return await handleTokenInner(request, env);
-  } catch {
+  } catch (e) {
     // Never echo request body, headers, or internal error details.
     // Raw token-endpoint bodies contain secrets (authorization_code,
     // code_verifier, refresh_token) and must not reach response bodies
-    // or unhandled-exception logs on the Cloudflare runtime side.
+    // or unhandled-exception logs on the Cloudflare runtime side. Log
+    // just the error name + first stack frame so operators can debug
+    // without pulling secrets into Cloudflare's tail logs.
+    try {
+      const name = e && e.name ? String(e.name) : "Error";
+      const frame = e && e.stack ? String(e.stack).split("\n")[1] ?? "" : "";
+      console.error("token_endpoint_error", name, frame.trim());
+    } catch {}
     return oauthJson({ error: "server_error" }, 500);
   }
 }
