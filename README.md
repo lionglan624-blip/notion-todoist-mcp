@@ -60,20 +60,27 @@ A custom [MCP (Model Context Protocol)](https://modelcontextprotocol.io/) server
 
 ### OAuth security tradeoffs
 
-This server uses **stateless HMAC-signed tokens** (no KV/DO) to stay free-tier friendly. Consequences to be aware of:
+Tokens themselves are **stateless HMAC-signed**; a single `OAUTH_STATE` KV namespace tracks just enough state to enforce single-use codes and refresh rotation (see below). Consequences to be aware of:
 
-- **Authorization codes are reusable until they expire** (5 minutes). A standards-compliant implementation (RFC 6749 §4.1.2) issues codes that MUST be one-time use. Without persistent storage we cannot track consumption. In a single-user deployment this is a low risk, but if you operate this for multiple users, front it with KV-backed code storage.
+- **Authorization codes are single-use** (RFC 6749 §4.1.2). Each code carries a `jti` that is written to `OAUTH_STATE` on consumption at `/token`; a second exchange within the 5-minute TTL returns `invalid_grant`.
+- **Refresh tokens rotate with reuse detection** (RFC 6749 §10.4 / RFC 6819 §5.2.2.3). Each refresh carries a `jti` (unique per rotation) and `fam` (family, stable across rotations). Using a refresh token issues a new one in the same family; attempting to use an already-rotated token poisons `fam:<fam>` in KV for 30 days, invalidating the whole lineage so a stolen token cannot outlive the legitimate client's next rotation.
+- **Sliding 30-day session.** The refresh token is re-issued on every use with a fresh 30-day expiry, so a client that keeps talking to the server stays logged in indefinitely. Only 30 consecutive days of silence (or a detected reuse) forces re-auth via `/authorize`.
 - `client_id` and `resource` are bound into the code at `/authorize` and re-verified at `/token`, so a stolen code cannot be redeemed for a different client or audience.
 - Every issued token is audience-bound (`aud` defaults to `${origin}/mcp` when the client omits `resource`), so tokens cannot be replayed against unrelated resource servers that might share the signing key in the future.
 - `redirect_uri` is checked against a host allowlist at both GET and POST on `/authorize` so a crafted authorize URL cannot forward the authorization code to an attacker-controlled host. Default allowlist: `claude.ai`, `claude.com`, `anthropic.com` (plus subdomains) and loopback. Override with the `ALLOWED_REDIRECT_HOSTS` var (comma-separated; `*.suffix` wildcards supported).
-- Login-secret comparison is constant-time (SHA-256 + byte-wise XOR). A 250 ms delay is added on failed attempts; for real brute-force defense, attach a Cloudflare Rate Limiting Rule to `POST /authorize`.
+- `POST /authorize` rejects cross-origin `Origin` headers to defeat browser-form CSRF (autofill / password-manager exploit). Same-origin and absent Origin (curl, server-to-server) are allowed.
+- Login-secret comparison is constant-time (SHA-256 + byte-wise XOR). A 200–400 ms jittered delay is added on failed attempts; for real brute-force defense, attach a Cloudflare Rate Limiting Rule to `POST /authorize`.
 - Only standard OAuth/PKCE parameters are re-emitted as hidden fields on the login page — non-standard query params are dropped so they cannot ride through.
 - Token-endpoint errors are caught and returned as a generic `server_error` so request bodies (which contain `code`, `code_verifier`, `refresh_token`) never appear in responses or unhandled-exception logs.
-- Upstream (Notion/Todoist) error messages are scrubbed of anything matching `Bearer <token>` before being returned through the MCP error channel.
+- Upstream (Notion/Todoist) error messages are scrubbed of anything matching `Bearer <token>` and truncated to 200 chars before being returned through the MCP error channel, so request-body echoes from the upstream API cannot leak caller data unbounded.
+- User-supplied IDs are validated before URL interpolation: Notion IDs must be 32-hex UUIDs (`normalizeId` throws otherwise) and Todoist IDs must match `[A-Za-z0-9_-]+` (`assertTodoistId`). This blocks path-pivot attacks like `task_id:"123/close"` silently turning `t_update_task` into `t_close_task`.
 
 #### Key rotation
 
-Tokens are not individually revocable. To invalidate every live access/refresh token (e.g. after suspected leakage), rotate `MCP_SIGNING_KEY`:
+Individual tokens are not revocable by serial number, but two mechanisms give you revocation-like behaviour:
+
+1. **Family poisoning** — if a refresh token is detected being re-used after rotation, its entire family is invalidated for 30 days and that client must re-auth.
+2. **Signing-key rotation** — to invalidate *every* live access/refresh token at once (e.g. after suspected key leakage), rotate `MCP_SIGNING_KEY`:
 
 ```bash
 npx wrangler secret put MCP_SIGNING_KEY   # enter a new random value
@@ -83,13 +90,21 @@ Any existing token signed under the old key fails HMAC verification on the next 
 
 ## Setup
 
-### 1. Deploy to Cloudflare Workers
+### 1. Create the OAuth state KV namespace
+
+```bash
+npx wrangler kv namespace create OAUTH_STATE
+```
+
+Copy the returned `id` into `wrangler.toml` under the existing `[[kv_namespaces]]` block (replace the committed ID with your own). This namespace stores the single-use code markers and refresh-rotation history — without it, `/token` fails closed with `server_error`.
+
+### 2. Deploy to Cloudflare Workers
 
 ```bash
 npx wrangler deploy
 ```
 
-### 2. Set secrets
+### 3. Set secrets
 
 ```bash
 npx wrangler secret put NOTION_TOKEN       # Notion integration token
@@ -104,18 +119,18 @@ npx wrangler secret put MCP_LOGIN_SECRET   # Password entered on the /authorize 
 
 Legacy deployments that set a single `MCP_SECRET` still work: both roles fall back to it when the split secrets are absent. New deployments should prefer the split form.
 
-### 3. Notion integration setup
+### 4. Notion integration setup
 
 1. Go to [Notion Integrations](https://www.notion.so/my-integrations) and create a new integration
 2. Copy the integration token
 3. Share each database you want to access with the integration
 
-### 4. Todoist API token
+### 5. Todoist API token
 
 1. Go to [Todoist Settings > Integrations > Developer](https://todoist.com/app/settings/integrations/developer)
 2. Copy your API token
 
-### 5. Register as MCP server
+### 6. Register as MCP server
 
 Add to your Claude Desktop / Claude Code MCP config. The client will perform OAuth discovery automatically:
 
