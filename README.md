@@ -55,7 +55,16 @@ A custom [MCP (Model Context Protocol)](https://modelcontextprotocol.io/) server
 - **Markdown body** — Page content accepts Markdown (headings, bullets, numbered lists, code blocks, bold/italic/code inline)
 - **Rate limit handling** — Notion, Todoist REST, and Todoist Sync requests auto-retry on 429 with exponential backoff
 - **Bulk operations** — `t_bulk` runs up to 3 concurrent operations and batches reorders into a single Sync API call
-- **OAuth 2.1** — `/mcp` endpoint is protected; dynamic client registration + PKCE supported
+- **OAuth 2.1** — `/mcp` endpoint is protected; dynamic client registration + PKCE supported. Access tokens are audience-bound via [RFC 8707 resource indicators](https://datatracker.ietf.org/doc/html/rfc8707) when the client sends a `resource` parameter, so a token leaked to an unrelated MCP server cannot be replayed against this one.
+
+### OAuth security tradeoffs
+
+This server uses **stateless HMAC-signed tokens** (no KV/DO) to stay free-tier friendly. Consequences to be aware of:
+
+- **Authorization codes are reusable until they expire** (5 minutes). A standards-compliant implementation (RFC 6749 §4.1.2) issues codes that MUST be one-time use. Without persistent storage we cannot track consumption. In a single-user deployment this is a low risk, but if you operate this for multiple users, front it with KV-backed code storage.
+- `client_id` and `resource` are bound into the code at `/authorize` and re-verified at `/token`, so a stolen code cannot be redeemed for a different client or audience.
+- Token-endpoint errors are caught and returned as a generic `server_error` so request bodies (which contain `code`, `code_verifier`, `refresh_token`) never appear in responses or unhandled-exception logs.
+- Upstream (Notion/Todoist) error messages are scrubbed of anything matching `Bearer <token>` before being returned through the MCP error channel.
 
 ## Setup
 

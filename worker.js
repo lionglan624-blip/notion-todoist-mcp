@@ -370,7 +370,20 @@ function compactProps(properties) {
       case "phone_number": out[k] = v.phone_number; break;
       case "formula":   out[k] = v.formula?.string ?? v.formula?.number ?? v.formula?.boolean ?? null; break;
       case "relation":  out[k] = v.relation.map(r => r.id); break;
-      case "rollup":    out[k] = v.rollup?.number ?? v.rollup?.array?.map(i => compactProps({v: i}).v) ?? null; break;
+      case "rollup": {
+        // Rollup payloads are either a scalar or an array of property-shaped
+        // items. Extract each array element by temporarily wrapping it so we
+        // can reuse the same switch — but do it via a clearer helper.
+        const rollupItem = (item) => {
+          if (!item || typeof item !== "object") return item;
+          const wrapped = compactProps({ __: item });
+          return wrapped.__;
+        };
+        out[k] = v.rollup?.number
+          ?? v.rollup?.array?.map(rollupItem)
+          ?? null;
+        break;
+      }
       case "created_time": out[k] = v.created_time; break;
       case "last_edited_time": out[k] = v.last_edited_time; break;
       default: out[k] = null;
@@ -554,6 +567,8 @@ async function todoistReq(token, method, path, body, _attempt = 0) {
 // Used for operations the REST API does not support, e.g. item_reorder.
 // Sends a batch of commands in one POST to /sync/v9/sync.
 // ─────────────────────────────────────────────
+// Note: retries reuse the same command `uuid` so Todoist deduplicates them
+// server-side — this keeps item_reorder idempotent across 5xx retries.
 async function todoistSync(token, commands, _attempt = 0) {
   const res = await fetch("https://api.todoist.com/api/v1/sync", {
     method: "POST",
@@ -1113,7 +1128,10 @@ const TOOL_HANDLERS = {
 
   n_query: async (args, { nt }) => {
       const id = normalizeId(args.database_id);
-      const body = { page_size: args.page_size ?? 20 };
+      // When auto-paginating, default to the Notion API max (100) so the
+      // 5-page safety cap actually reaches the 500-row hard limit.
+      const defaultPageSize = args.fetch_all === true ? 100 : 20;
+      const body = { page_size: args.page_size ?? defaultPageSize };
       if (args.filter) body.filter = resolveFilterDates(args.filter);
       if (args.sorts)  body.sorts = args.sorts;
 
@@ -1259,6 +1277,7 @@ const TOOL_HANDLERS = {
 
   n_update_page: async (args, { nt }) => {
       const pid = normalizeId(args.page_id);
+      let replaceWarnings = null;
       // 1. Property / archived update
       if (args.properties || args.archived !== undefined) {
         const body = {};
@@ -1266,23 +1285,38 @@ const TOOL_HANDLERS = {
         if (args.archived !== undefined) body.archived = args.archived;
         await notionReq(nt, "PATCH", `/pages/${pid}`, body);
       }
-      // 2. replace_content: delete all existing blocks then append new ones
+      // 2. replace_content: append new blocks FIRST, then delete old ones.
+      // Order matters: if we deleted first and the append failed, the page
+      // would be wiped. Appending first means a partial failure leaves the
+      // old content intact alongside the new content (recoverable).
       if (args.replace_content !== undefined) {
-        // Paginate through all existing children — page_size=100 is the Notion API max
-        const allBlocks = [];
+        // Snapshot existing children (page_size=100 is the Notion API max)
+        const oldBlocks = [];
         let cursor;
         do {
           const qs = cursor ? `?page_size=100&start_cursor=${cursor}` : `?page_size=100`;
           const page = await notionReq(nt, "GET", `/blocks/${pid}/children${qs}`);
-          allBlocks.push(...page.results);
+          oldBlocks.push(...page.results);
           cursor = page.has_more ? page.next_cursor : null;
         } while (cursor);
-        for (const blk of allBlocks) {
-          await notionReq(nt, "DELETE", `/blocks/${blk.id}`, undefined).catch(() => {});
-        }
+
         const newBlocks = mdToBlocks(args.replace_content);
         if (newBlocks.length) {
           await notionReq(nt, "PATCH", `/blocks/${pid}/children`, { children: newBlocks });
+        }
+        // Only delete old blocks after new content is safely in place.
+        // Track deletion failures so the caller knows the page has stale blocks.
+        const deleteFailures = [];
+        for (const blk of oldBlocks) {
+          try {
+            await notionReq(nt, "DELETE", `/blocks/${blk.id}`);
+          } catch (e) {
+            deleteFailures.push({ id: blk.id, error: e.message });
+          }
+        }
+        if (deleteFailures.length) {
+          // Non-fatal: surface as a warning so the caller can clean up.
+          replaceWarnings = deleteFailures;
         }
       }
       // 3. append_content: append blocks after existing content
@@ -1293,7 +1327,9 @@ const TOOL_HANDLERS = {
         }
       }
       const p = await notionReq(nt, "GET", `/pages/${pid}`);
-      return { id: p.id, url: p.url, last_edited_time: p.last_edited_time };
+      const out = { id: p.id, url: p.url, last_edited_time: p.last_edited_time };
+      if (replaceWarnings) out.replace_warnings = replaceWarnings;
+      return out;
   },
 
   n_search: async (args, { nt }) => {
@@ -1567,14 +1603,19 @@ const TOOL_HANDLERS = {
             args: { items: reorderItems },
           }]);
         } catch (e) {
-          // Mark affected results as failed
-          for (const item of reorderItems) {
-            const r = results.find(r => r.task_id === item.id);
-            if (r) { r.ok = false; r.error = `Reorder failed: ${e.message}`; }
+          // Mark every op that contributed a reorder as failed.
+          // Use filter (not find) so duplicate task_ids across ops are all caught.
+          const affectedIds = new Set(reorderItems.map(i => i.id));
+          for (const r of results) {
+            if (r.action === "update" && affectedIds.has(r.task_id)) {
+              r.ok = false;
+              r.error = `Reorder failed: ${e.message}`;
+            }
           }
         }
       }
 
+      // Recompute after reorder-failure marking above
       const succeeded = results.filter(r => r.ok).length;
       const failed = results.filter(r => !r.ok).length;
       return {
@@ -1652,6 +1693,20 @@ async function handleMCP(request, url, env) {
   const authHeader = request.headers.get("Authorization") ?? "";
   const token = authHeader.replace(/^Bearer\s+/i, "");
   const verified = token ? await verifyToken(token, "access", env).catch(() => null) : null;
+  // RFC 8707: if the access token was bound to a specific resource, enforce it.
+  // Accept both `${origin}/mcp` and `${origin}` as the canonical resource identifier.
+  if (verified?.aud) {
+    const expected = [`${url.origin}/mcp`, url.origin];
+    if (!expected.includes(verified.aud)) {
+      return new Response(JSON.stringify({ error: "invalid_token" }), {
+        status: 401,
+        headers: {
+          "Content-Type": "application/json",
+          "WWW-Authenticate": `Bearer error="invalid_token", error_description="audience mismatch"`,
+        },
+      });
+    }
+  }
   if (!verified) {
     const resourceMeta = `${url.origin}/.well-known/oauth-protected-resource`;
     return new Response(JSON.stringify({ error: "unauthorized" }), {
@@ -1676,7 +1731,7 @@ async function handleMCP(request, url, env) {
         result = {
           protocolVersion: MCP_VERSION,
           capabilities: { tools: {} },
-          serverInfo: { name: "notion-todoist-mcp", version: "1.7.0" },
+          serverInfo: { name: "notion-todoist-mcp", version: "1.8.0" },
         };
         break;
 
@@ -1725,7 +1780,13 @@ function jsonResp(obj, status = 200) {
 }
 
 function rpcErr(id, code, message) {
-  return jsonResp({ jsonrpc: "2.0", id, error: { code, message } });
+  // Defense in depth: scrub anything that looks like a bearer token so an
+  // upstream error that accidentally echoes our Authorization header can't
+  // leak credentials through the MCP error channel.
+  const safe = typeof message === "string"
+    ? message.replace(/Bearer\s+[A-Za-z0-9._\-+/=]+/gi, "Bearer [REDACTED]")
+    : message;
+  return jsonResp({ jsonrpc: "2.0", id, error: { code, message: safe } });
 }
 
 // ─────────────────────────────────────────────
@@ -1837,6 +1898,9 @@ function handleAuthServerMetadata(url) {
     code_challenge_methods_supported: ["S256"],
     token_endpoint_auth_methods_supported: ["none"],
     scopes_supported: ["mcp"],
+    // RFC 8707 — clients SHOULD send `resource` at /authorize and /token
+    // so tokens are audience-bound to this MCP server.
+    resource_indicators_supported: true,
   });
 }
 
@@ -1896,6 +1960,10 @@ async function handleAuthorize(request, url, env) {
       exp: Math.floor(Date.now() / 1000) + 300,
       cc: p.code_challenge,
       ru: p.redirect_uri,
+      ci: p.client_id || "mcp-public-client",
+      // RFC 8707 resource indicator — bound to access token audience below.
+      // Optional: if the client omits it, no audience restriction is applied.
+      ...(p.resource ? { aud: p.resource } : {}),
     }, env);
     const redirect = new URL(p.redirect_uri);
     redirect.searchParams.set("code", code);
@@ -1927,13 +1995,35 @@ async function handleTokenInner(request, env) {
     const code = form.get("code");
     const verifier = form.get("code_verifier");
     const redirectUri = form.get("redirect_uri");
+    const clientId = form.get("client_id");
+    const resource = form.get("resource");
     const payload = await verifyToken(code ?? "", "code", env).catch(() => null);
     if (!payload) return oauthJson({ error: "invalid_grant" }, 400);
     if (payload.ru !== redirectUri) return oauthJson({ error: "invalid_grant" }, 400);
+    // client_id must match the value bound at /authorize if the client sends one.
+    if (clientId && payload.ci && clientId !== payload.ci) {
+      return oauthJson({ error: "invalid_grant" }, 400);
+    }
+    // If /authorize bound a resource, the /token call must ask for the same one
+    // (or omit it). This enforces RFC 8707 audience restriction end-to-end.
+    if (resource && payload.aud && resource !== payload.aud) {
+      return oauthJson({ error: "invalid_target" }, 400);
+    }
     const challenge = await sha256b64u(verifier ?? "");
     if (challenge !== payload.cc) return oauthJson({ error: "invalid_grant" }, 400);
-    const access = await signToken({ typ: "access", exp: now + 3600 }, env);
-    const refresh = await signToken({ typ: "refresh", exp: now + 60 * 60 * 24 * 30 }, env);
+    const aud = payload.aud || resource || null;
+    const access = await signToken({
+      typ: "access",
+      exp: now + 3600,
+      ci: payload.ci,
+      ...(aud ? { aud } : {}),
+    }, env);
+    const refresh = await signToken({
+      typ: "refresh",
+      exp: now + 60 * 60 * 24 * 30,
+      ci: payload.ci,
+      ...(aud ? { aud } : {}),
+    }, env);
     return oauthJson({
       access_token: access,
       token_type: "Bearer",
@@ -1945,9 +2035,19 @@ async function handleTokenInner(request, env) {
 
   if (grant === "refresh_token") {
     const rt = form.get("refresh_token");
+    const resource = form.get("resource");
     const payload = await verifyToken(rt ?? "", "refresh", env).catch(() => null);
     if (!payload) return oauthJson({ error: "invalid_grant" }, 400);
-    const access = await signToken({ typ: "access", exp: now + 3600 }, env);
+    // Down-scoping is allowed only if the new resource matches the original.
+    if (resource && payload.aud && resource !== payload.aud) {
+      return oauthJson({ error: "invalid_target" }, 400);
+    }
+    const access = await signToken({
+      typ: "access",
+      exp: now + 3600,
+      ci: payload.ci,
+      ...(payload.aud ? { aud: payload.aud } : {}),
+    }, env);
     return oauthJson({
       access_token: access,
       token_type: "Bearer",
