@@ -227,11 +227,6 @@ function safeMath(expr) {
 // Todoist compact & TSV helpers
 // ─────────────────────────────────────────────
 const TASK_COMPACT_DEFAULTS = ["id", "section", "co", "content", "labels", "due"];
-const TASK_FULL_MAP = {
-  id: "id", section: "(resolved)", sid: "section_id", co: "child_order",
-  content: "content", labels: "labels", due: "due", pid: "parent_id",
-  pri: "priority", desc: "description", proj: "project_id", rec: "due",
-};
 
 function compactTask(t, fields, sectionMap) {
   const f = fields || TASK_COMPACT_DEFAULTS;
@@ -1423,15 +1418,23 @@ const TOOL_HANDLERS = {
 
       if (args.section || needsSectionName) {
         const pid = projectId || args.project_id;
-        if (!pid) return { error: "project_id is required when using section name or section output field" };
-        const { map, sections } = await buildSectionMap(tt, pid);
-        sectionMap = map;
-        if (args.section) {
-          const match = sections.find(s =>
-            s.name === args.section || s.name.includes(args.section)
-          );
-          if (!match) return { error: `Section not found: "${args.section}". Available: ${sections.map(s => s.name).join(", ")}` };
-          sectionId = match.id;
+        if (!pid) {
+          // Explicit section-name lookup requires a project; defaulted field
+          // list ("section") can degrade silently so filter/ids/label calls
+          // aren't blocked.
+          if (args.section) {
+            return { error: "project_id is required when filtering by section name" };
+          }
+        } else {
+          const { map, sections } = await buildSectionMap(tt, pid);
+          sectionMap = map;
+          if (args.section) {
+            const match = sections.find(s =>
+              s.name === args.section || s.name.includes(args.section)
+            );
+            if (!match) return { error: `Section not found: "${args.section}". Available: ${sections.map(s => s.name).join(", ")}` };
+            sectionId = match.id;
+          }
         }
       }
 
