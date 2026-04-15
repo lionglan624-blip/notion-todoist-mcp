@@ -85,8 +85,11 @@ export async function todoistReq(token, method, path, body, _attempt = 0) {
 
   // Rate limited — wait and retry (max 4 attempts)
   if (res.status === 429 && _attempt < 4) {
-    const retryAfter = parseInt(res.headers.get("Retry-After") || "1", 10);
-    const waitMs = Math.max(retryAfter * 1000, 400 * Math.pow(2, _attempt));
+    // Retry-After may be delta-seconds or an HTTP-date; guard against NaN so
+    // a non-numeric header doesn't collapse the wait to zero.
+    const retryAfter = parseInt(res.headers.get("Retry-After") ?? "", 10);
+    const headerMs = Number.isFinite(retryAfter) ? retryAfter * 1000 : 0;
+    const waitMs = Math.max(headerMs, 400 * Math.pow(2, _attempt));
     await sleep(waitMs);
     return todoistReq(token, method, path, body, _attempt + 1);
   }
@@ -124,8 +127,9 @@ export async function todoistSync(token, commands, _attempt = 0) {
     body: JSON.stringify({ commands }),
   });
   if (res.status === 429 && _attempt < 4) {
-    const retryAfter = parseInt(res.headers.get("Retry-After") || "1", 10);
-    await sleep(Math.max(retryAfter * 1000, 400 * Math.pow(2, _attempt)));
+    const retryAfter = parseInt(res.headers.get("Retry-After") ?? "", 10);
+    const headerMs = Number.isFinite(retryAfter) ? retryAfter * 1000 : 0;
+    await sleep(Math.max(headerMs, 400 * Math.pow(2, _attempt)));
     return todoistSync(token, commands, _attempt + 1);
   }
   if (res.status >= 500 && _attempt < 1) {

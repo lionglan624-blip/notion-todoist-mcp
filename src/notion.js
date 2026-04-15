@@ -16,8 +16,12 @@ export async function notionReq(token, method, path, body, _attempt = 0) {
 
   // Rate limited — wait and retry (max 4 attempts)
   if (res.status === 429 && _attempt < 4) {
-    const retryAfter = parseInt(res.headers.get("Retry-After") || "1", 10);
-    const waitMs = Math.max(retryAfter * 1000, 400 * Math.pow(2, _attempt));
+    // Retry-After can be delta-seconds or an HTTP-date (RFC 7231).
+    // parseInt on a date string yields NaN → fall back to exponential backoff
+    // instead of retrying immediately, which would defeat rate-limit handling.
+    const retryAfter = parseInt(res.headers.get("Retry-After") ?? "", 10);
+    const headerMs = Number.isFinite(retryAfter) ? retryAfter * 1000 : 0;
+    const waitMs = Math.max(headerMs, 400 * Math.pow(2, _attempt));
     await sleep(waitMs);
     return notionReq(token, method, path, body, _attempt + 1);
   }
