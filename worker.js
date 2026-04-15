@@ -1457,7 +1457,7 @@ const TOOL_HANDLERS = {
       if (args.section_id)  body.section_id = args.section_id;
       if (args.parent_id)   body.parent_id = args.parent_id;
       if (args.labels)      body.labels = args.labels;
-      if (args.priority)    body.priority = args.priority;
+      if (args.priority !== undefined) body.priority = args.priority;
       if (args.description) body.description = args.description;
       if (args.order !== undefined) body.order = args.order;
       if (args.due_date)   body.due_date = evalDate(args.due_date);
@@ -1470,7 +1470,7 @@ const TOOL_HANDLERS = {
       const body = {};
       if (rest.content)     body.content = rest.content;
       if (rest.labels)      body.labels = rest.labels;
-      if (rest.priority)    body.priority = rest.priority;
+      if (rest.priority !== undefined) body.priority = rest.priority;
       if (rest.description) body.description = rest.description;
       if (rest.section_id)  body.section_id = rest.section_id;
       if (rest.project_id)  body.project_id = rest.project_id;
@@ -1542,7 +1542,7 @@ const TOOL_HANDLERS = {
               const body = {};
               if (op.content)     body.content = op.content;
               if (op.labels)      body.labels = op.labels;
-              if (op.priority)    body.priority = op.priority;
+              if (op.priority !== undefined) body.priority = op.priority;
               if (op.description) body.description = op.description;
               if (op.section_id)  body.section_id = op.section_id;
               if (op.project_id)  body.project_id = op.project_id;
@@ -1574,7 +1574,7 @@ const TOOL_HANDLERS = {
               if (op.section_id)  body.section_id = op.section_id;
               if (op.parent_id)   body.parent_id = op.parent_id;
               if (op.labels)      body.labels = op.labels;
-              if (op.priority)    body.priority = op.priority;
+              if (op.priority !== undefined) body.priority = op.priority;
               if (op.description) body.description = op.description;
               if (op.order !== undefined) body.order = op.order;
               if (op.due_date)    body.due_date = evalDate(op.due_date);
