@@ -3,3 +3,4 @@ _out/
 node_modules/
 build.bat
 push.bat
+CLAUDE.md
