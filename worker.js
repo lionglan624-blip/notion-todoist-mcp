@@ -1057,47 +1057,46 @@ const TOOLS = [
 // ─────────────────────────────────────────────
 // Tool handlers
 // ─────────────────────────────────────────────
-async function runTool(env, name, args) {
-  const nt = env.NOTION_TOKEN;
-  const tt = env.TODOIST_TOKEN;
+// ─────────────────────────────────────────────
+// Tool handlers — dispatched via TOOL_HANDLERS map below.
+// Each handler receives (args, ctx) where ctx = { env, nt, tt }.
+// ─────────────────────────────────────────────
+const TOOL_HANDLERS = {
+  // ── Utility ──
+  eval_date: (args) => ({ expression: args.expression, resolved: evalDate(args.expression) }),
 
-  switch (name) {
-    // ── Utility ──
-    case "eval_date":
-      return { expression: args.expression, resolved: evalDate(args.expression) };
+  calculate: (args) => {
+    const result = safeMath(args.expression);
+    return { expression: args.expression, result };
+  },
 
-    case "calculate": {
-      const result = safeMath(args.expression);
-      return { expression: args.expression, result };
-    }
+  stats: (args) => {
+    const nums = (args.values || []).filter(n => typeof n === "number" && !isNaN(n));
+    if (!nums.length) return { error: "No valid numbers provided" };
+    const sorted = [...nums].sort((a, b) => a - b);
+    const sum = nums.reduce((a, b) => a + b, 0);
+    const avg = sum / nums.length;
+    const mid = Math.floor(sorted.length / 2);
+    const median = sorted.length % 2 === 0
+      ? (sorted[mid - 1] + sorted[mid]) / 2
+      : sorted[mid];
+    const r = args.round ?? null;
+    const fmt = (n) => r !== null ? Math.round(n * 10 ** r) / 10 ** r : n;
+    return {
+      count: nums.length,
+      sum: fmt(sum),
+      avg: fmt(avg),
+      min: sorted[0],
+      max: sorted[sorted.length - 1],
+      first: nums[0],
+      last: nums[nums.length - 1],
+      delta: fmt(nums[nums.length - 1] - nums[0]),
+      median: fmt(median),
+    };
+  },
 
-    case "stats": {
-      const nums = (args.values || []).filter(n => typeof n === "number" && !isNaN(n));
-      if (!nums.length) return { error: "No valid numbers provided" };
-      const sorted = [...nums].sort((a, b) => a - b);
-      const sum = nums.reduce((a, b) => a + b, 0);
-      const avg = sum / nums.length;
-      const mid = Math.floor(sorted.length / 2);
-      const median = sorted.length % 2 === 0
-        ? (sorted[mid - 1] + sorted[mid]) / 2
-        : sorted[mid];
-      const r = args.round ?? null;
-      const fmt = (n) => r !== null ? Math.round(n * 10 ** r) / 10 ** r : n;
-      return {
-        count: nums.length,
-        sum: fmt(sum),
-        avg: fmt(avg),
-        min: sorted[0],
-        max: sorted[sorted.length - 1],
-        first: nums[0],
-        last: nums[nums.length - 1],
-        delta: fmt(nums[nums.length - 1] - nums[0]),
-        median: fmt(median),
-      };
-    }
-
-    // ── Notion ──
-    case "n_get_schema": {
+  // ── Notion ──
+  n_get_schema: async (args, { nt }) => {
       const id = normalizeId(args.database_id);
       const db = await notionReq(nt, "GET", `/databases/${id}`);
       const schema = {};
@@ -1109,10 +1108,10 @@ async function runTool(env, name, args) {
         if (prop.relation)     schema[pname].database_id = prop.relation.database_id;
         if (prop.number)       schema[pname].format = prop.number.format;
       }
-      return { title: db.title?.[0]?.plain_text, database_id: id, properties: schema };
-    }
+    return { title: db.title?.[0]?.plain_text, database_id: id, properties: schema };
+  },
 
-    case "n_query": {
+  n_query: async (args, { nt }) => {
       const id = normalizeId(args.database_id);
       const body = { page_size: args.page_size ?? 20 };
       if (args.filter) body.filter = resolveFilterDates(args.filter);
@@ -1189,14 +1188,14 @@ async function runTool(env, name, args) {
         }
       }
       return out;
-    }
+  },
 
-    case "n_get_page": {
-      const p = await notionReq(nt, "GET", `/pages/${normalizeId(args.page_id)}`);
-      return { id: p.id, url: p.url, created_time: p.created_time, last_edited_time: p.last_edited_time, properties: p.properties };
-    }
+  n_get_page: async (args, { nt }) => {
+    const p = await notionReq(nt, "GET", `/pages/${normalizeId(args.page_id)}`);
+    return { id: p.id, url: p.url, created_time: p.created_time, last_edited_time: p.last_edited_time, properties: p.properties };
+  },
 
-    case "n_get_blocks": {
+  n_get_blocks: async (args, { nt }) => {
       const id = normalizeId(args.page_id);
       const pageSize = args.page_size ?? 100;
       const res = await notionReq(nt, "GET", `/blocks/${id}/children?page_size=${pageSize}`);
@@ -1210,10 +1209,9 @@ async function runTool(env, name, args) {
         return { id: b.id, type, text, has_children: b.has_children };
       });
       return { block_count: blocks.length, has_more: res.has_more, next_cursor: res.next_cursor, blocks };
-    }
+  },
 
-    // ★ FIX: handler was missing in original
-    case "n_create_database": {
+  n_create_database: async (args, { nt }) => {
       const body = {
         parent: { page_id: normalizeId(args.parent_page_id) },
         title: [{ type: "text", text: { content: args.title } }],
@@ -1222,10 +1220,9 @@ async function runTool(env, name, args) {
       if (args.icon) body.icon = { type: "emoji", emoji: args.icon };
       const db = await notionReq(nt, "POST", "/databases", body);
       return { id: db.id, url: db.url, title: args.title };
-    }
+  },
 
-    // ★ FIX: handler was missing in original
-    case "n_update_schema": {
+  n_update_schema: async (args, { nt }) => {
       const id = normalizeId(args.database_id);
       const body = {};
       if (args.title) {
@@ -1244,9 +1241,9 @@ async function runTool(env, name, args) {
       }
       const db = await notionReq(nt, "PATCH", `/databases/${id}`, body);
       return { id: db.id, url: db.url, last_edited_time: db.last_edited_time };
-    }
+  },
 
-    case "n_create_page": {
+  n_create_page: async (args, { nt }) => {
       const id = normalizeId(args.database_id);
       const body = {
         parent: { database_id: id },
@@ -1258,9 +1255,9 @@ async function runTool(env, name, args) {
       }
       const p = await notionReq(nt, "POST", "/pages", body);
       return { id: p.id, url: p.url, created_time: p.created_time };
-    }
+  },
 
-    case "n_update_page": {
+  n_update_page: async (args, { nt }) => {
       const pid = normalizeId(args.page_id);
       // 1. Property / archived update
       if (args.properties || args.archived !== undefined) {
@@ -1297,9 +1294,9 @@ async function runTool(env, name, args) {
       }
       const p = await notionReq(nt, "GET", `/pages/${pid}`);
       return { id: p.id, url: p.url, last_edited_time: p.last_edited_time };
-    }
+  },
 
-    case "n_search": {
+  n_search: async (args, { nt }) => {
       const body = { query: args.query, page_size: args.page_size ?? 10 };
       if (args.type) body.filter = { value: args.type, property: "object" };
       const res = await notionReq(nt, "POST", "/search", body);
@@ -1311,58 +1308,59 @@ async function runTool(env, name, args) {
         })),
         has_more: res.has_more,
       };
-    }
+  },
 
-    // ── Todoist ──
-    case "t_get_projects": {
+  // ── Todoist ──
+  t_get_projects: async (args, { tt }) => {
       const raw = await todoistReq(tt, "GET", "/projects");
       const items = Array.isArray(raw) ? raw : (raw?.results ?? []);
       return formatTodoistList(items, (p) => compactProject(p), args);
-    }
+  },
 
-    case "t_get_sections": {
+  t_get_sections: async (args, { tt }) => {
       const raw = await todoistReq(tt, "GET", `/sections?project_id=${args.project_id}`);
       const items = Array.isArray(raw) ? raw : (raw?.results ?? []);
       return formatTodoistList(items, (s) => compactSection(s), args);
-    }
+  },
 
-    case "t_create_section": {
-      const body = { name: args.name, project_id: args.project_id };
-      if (args.order !== undefined) body.order = args.order;
-      return todoistReq(tt, "POST", "/sections", body);
-    }
+  t_create_section: async (args, { tt }) => {
+    const body = { name: args.name, project_id: args.project_id };
+    if (args.order !== undefined) body.order = args.order;
+    return todoistReq(tt, "POST", "/sections", body);
+  },
 
-    case "t_get_labels":
-      return todoistReq(tt, "GET", "/labels");
+  t_get_labels: async (args, { tt }) => todoistReq(tt, "GET", "/labels"),
 
-    case "t_create_project": {
+  t_create_project: async (args, { tt }) => {
       const body = { name: args.name };
       if (args.color)       body.color = args.color;
       if (args.is_favorite !== undefined) body.is_favorite = args.is_favorite;
       return todoistReq(tt, "POST", "/projects", body);
-    }
+  },
 
-    case "t_update_project": {
+  t_update_project: async (args, { tt }) => {
       const { project_id, ...rest } = args;
       const body = {};
       if (rest.name)        body.name = rest.name;
       if (rest.color)       body.color = rest.color;
       if (rest.is_favorite !== undefined) body.is_favorite = rest.is_favorite;
       return todoistReq(tt, "POST", `/projects/${project_id}`, body);
-    }
+  },
 
-    case "t_delete_project":
-      await todoistReq(tt, "DELETE", `/projects/${args.project_id}`);
-      return { success: true, project_id: args.project_id };
+  t_delete_project: async (args, { tt }) => {
+    await todoistReq(tt, "DELETE", `/projects/${args.project_id}`);
+    return { success: true, project_id: args.project_id };
+  },
 
-    case "t_update_section":
-      return todoistReq(tt, "POST", `/sections/${args.section_id}`, { name: args.name });
+  t_update_section: async (args, { tt }) =>
+    todoistReq(tt, "POST", `/sections/${args.section_id}`, { name: args.name }),
 
-    case "t_delete_section":
-      await todoistReq(tt, "DELETE", `/sections/${args.section_id}`);
-      return { success: true, section_id: args.section_id };
+  t_delete_section: async (args, { tt }) => {
+    await todoistReq(tt, "DELETE", `/sections/${args.section_id}`);
+    return { success: true, section_id: args.section_id };
+  },
 
-    case "t_get_task": {
+  t_get_task: async (args, { tt }) => {
       const raw = await todoistReq(tt, "GET", `/tasks/${args.task_id}`);
       if (args.compact === false) return raw;
       // Resolve section name if 'section' field is requested
@@ -1373,9 +1371,9 @@ async function runTool(env, name, args) {
         secMap = map;
       }
       return compactTask(raw, args.fields, secMap);
-    }
+  },
 
-    case "t_get_tasks": {
+  t_get_tasks: async (args, { env, tt }) => {
       // Default project_id from config if not specified and no filter/label/ids
       let projectId = args.project_id;
       if (!projectId && !args.filter && !args.label && !args.ids?.length) {
@@ -1412,9 +1410,9 @@ async function runTool(env, name, args) {
       const raw = await todoistReq(tt, "GET", `/tasks${qs ? "?" + qs : ""}`);
       const items = Array.isArray(raw) ? raw : (raw?.results ?? []);
       return formatTodoistList(items, (t) => compactTask(t, args.fields, sectionMap), args);
-    }
+  },
 
-    case "t_create_task": {
+  t_create_task: async (args, { tt }) => {
       const body = { content: args.content };
       if (args.project_id)  body.project_id = args.project_id;
       if (args.section_id)  body.section_id = args.section_id;
@@ -1426,9 +1424,9 @@ async function runTool(env, name, args) {
       if (args.due_date)   body.due_date = evalDate(args.due_date);
       if (args.due_string) body.due_string = args.due_string;
       return todoistReq(tt, "POST", "/tasks", body);
-    }
+  },
 
-    case "t_update_task": {
+  t_update_task: async (args, { tt }) => {
       const { task_id, ...rest } = args;
       const body = {};
       if (rest.content)     body.content = rest.content;
@@ -1441,17 +1439,19 @@ async function runTool(env, name, args) {
       if (rest.due_date)    body.due_date = evalDate(rest.due_date);
       if (rest.due_string)  body.due_string = rest.due_string;
       return todoistReq(tt, "POST", `/tasks/${task_id}`, body);
-    }
+  },
 
-    case "t_close_task":
-      await todoistReq(tt, "POST", `/tasks/${args.task_id}/close`);
-      return { success: true, task_id: args.task_id };
+  t_close_task: async (args, { tt }) => {
+    await todoistReq(tt, "POST", `/tasks/${args.task_id}/close`);
+    return { success: true, task_id: args.task_id };
+  },
 
-    case "t_reopen_task":
-      await todoistReq(tt, "POST", `/tasks/${args.task_id}/reopen`);
-      return { success: true, task_id: args.task_id };
+  t_reopen_task: async (args, { tt }) => {
+    await todoistReq(tt, "POST", `/tasks/${args.task_id}/reopen`);
+    return { success: true, task_id: args.task_id };
+  },
 
-    case "t_get_completed_tasks": {
+  t_get_completed_tasks: async (args, { env, tt }) => {
       // Unified API v1: GET /api/v1/tasks/completed/by_completion_date
       // since & until are required by the API; default to last 7 days
       const since = evalDate(args.since ?? "today-7d");
@@ -1480,13 +1480,14 @@ async function runTool(env, name, args) {
         sectionMap = map;
       }
       return formatTodoistList(items, (t) => compactTask(t, defaultFields, sectionMap), args);
-    }
+  },
 
-    case "t_delete_task":
-      await todoistReq(tt, "DELETE", `/tasks/${args.task_id}`);
-      return { success: true, task_id: args.task_id };
+  t_delete_task: async (args, { tt }) => {
+    await todoistReq(tt, "DELETE", `/tasks/${args.task_id}`);
+    return { success: true, task_id: args.task_id };
+  },
 
-    case "t_bulk": {
+  t_bulk: async (args, { tt }) => {
       const ops = args.operations ?? [];
       if (!ops.length) return { error: "No operations provided" };
 
@@ -1581,9 +1582,9 @@ async function runTool(env, name, args) {
         ...(failed > 0 && { partial_failure: true }),
         results,
       };
-    }
+  },
 
-    case "context": {
+  context: async (args, { env, nt, tt }) => {
       // Resolve config
       let inboxPid, habitsPageId;
       try { inboxPid = JSON.parse(env.TODOIST_CONFIG).inbox_project_id; } catch {}
@@ -1619,9 +1620,9 @@ async function runTool(env, name, args) {
       ]);
 
       return { todoist_tasks: tasksResult, habits: habitsResult };
-    }
+  },
 
-    case "help": {
+  help: (args, { env }) => {
       const config = {};
       if (env.NOTION_DB_IDS) {
         try { config.notion_dbs = JSON.parse(env.NOTION_DB_IDS); } catch {}
@@ -1633,11 +1634,13 @@ async function runTool(env, name, args) {
         tools: TOOLS.map(t => ({ name: t.name, inputSchema: t.inputSchema })),
         ...config,
       };
-    }
+  },
+};
 
-    default:
-      throw new Error(`Unknown tool: ${name}`);
-  }
+async function runTool(env, name, args) {
+  const handler = TOOL_HANDLERS[name];
+  if (!handler) throw new Error(`Unknown tool: ${name}`);
+  return handler(args, { env, nt: env.NOTION_TOKEN, tt: env.TODOIST_TOKEN });
 }
 
 // ─────────────────────────────────────────────
@@ -1707,10 +1710,17 @@ async function handleMCP(request, url, env) {
   }
 }
 
+// MCP and /health responses: no CORS wildcard.
+// The /mcp endpoint requires a Bearer token, and MCP clients are native
+// (not browsers), so advertising `Access-Control-Allow-Origin: *` only
+// benefits attackers running JS in a victim's browser tab.
+// OAuth discovery/registration/authorize/token endpoints use oauthJson()
+// below, which still returns CORS headers since those are legitimately
+// called cross-origin by browser-based OAuth clients.
 function jsonResp(obj, status = 200) {
   return new Response(JSON.stringify(obj), {
     status,
-    headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" },
+    headers: { "Content-Type": "application/json" },
   });
 }
 
@@ -1749,19 +1759,33 @@ async function hmacKey(secret) {
   );
 }
 
+// Separate the HMAC signing key from the login password.
+// MCP_SIGNING_KEY: HMAC-SHA256 secret used to sign/verify OAuth tokens.
+// MCP_LOGIN_SECRET: password the user types on the /authorize login page.
+// If either is unset, fall back to MCP_SECRET for backwards compatibility
+// with existing single-secret deployments.
+function getSigningKey(env) {
+  return env.MCP_SIGNING_KEY || env.MCP_SECRET;
+}
+function getLoginSecret(env) {
+  return env.MCP_LOGIN_SECRET || env.MCP_SECRET;
+}
+
 async function signToken(payload, env) {
-  if (!env.MCP_SECRET) throw new Error("MCP_SECRET not set");
-  const key = await hmacKey(env.MCP_SECRET);
+  const secret = getSigningKey(env);
+  if (!secret) throw new Error("signing key not configured");
+  const key = await hmacKey(secret);
   const body = b64u.encStr(JSON.stringify(payload));
   const sig = await crypto.subtle.sign("HMAC", key, new TextEncoder().encode(body));
   return `${body}.${b64u.enc(sig)}`;
 }
 
 async function verifyToken(token, expectedTyp, env) {
-  if (!env.MCP_SECRET) return null;
+  const secret = getSigningKey(env);
+  if (!secret) return null;
   const [body, sig] = token.split(".");
   if (!body || !sig) return null;
-  const key = await hmacKey(env.MCP_SECRET);
+  const key = await hmacKey(secret);
   const ok = await crypto.subtle.verify(
     "HMAC",
     key,
@@ -1840,7 +1864,7 @@ function loginPage(params, errorMsg) {
 input[type=password]{width:100%;padding:10px;font-size:16px;box-sizing:border-box}
 button{margin-top:12px;padding:10px 20px;font-size:16px;cursor:pointer}</style></head>
 <body><h2>MCP Server Sign-in</h2>
-<p>Enter your <code>MCP_SECRET</code> to authorize this client.</p>
+<p>Enter your login secret (<code>MCP_LOGIN_SECRET</code>) to authorize this client.</p>
 ${err}<form method="POST" action="/authorize">${hidden}
 <input type="password" name="secret" autofocus required>
 <button type="submit">Authorize</button></form></body></html>`,
@@ -1863,7 +1887,8 @@ async function handleAuthorize(request, url, env) {
   if (request.method === "POST") {
     const form = await request.formData();
     const p = Object.fromEntries(form);
-    if (!env.MCP_SECRET || p.secret !== env.MCP_SECRET) {
+    const expectedLogin = getLoginSecret(env);
+    if (!expectedLogin || p.secret !== expectedLogin) {
       return loginPage(p, "Invalid secret");
     }
     const code = await signToken({
@@ -1881,6 +1906,18 @@ async function handleAuthorize(request, url, env) {
 }
 
 async function handleToken(request, env) {
+  try {
+    return await handleTokenInner(request, env);
+  } catch {
+    // Never echo request body, headers, or internal error details.
+    // Raw token-endpoint bodies contain secrets (authorization_code,
+    // code_verifier, refresh_token) and must not reach response bodies
+    // or unhandled-exception logs on the Cloudflare runtime side.
+    return oauthJson({ error: "server_error" }, 500);
+  }
+}
+
+async function handleTokenInner(request, env) {
   if (request.method !== "POST") return new Response("Method Not Allowed", { status: 405 });
   const form = await request.formData();
   const grant = form.get("grant_type");
