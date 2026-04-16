@@ -535,12 +535,17 @@ const TOOL_HANDLERS = {
       if (rest.labels)      body.labels = rest.labels;
       if (rest.priority !== undefined) body.priority = rest.priority;
       if (rest.description) body.description = rest.description;
-      if (rest.section_id)  body.section_id = rest.section_id;
       if (rest.project_id)  body.project_id = rest.project_id;
       if (rest.parent_id !== undefined) body.parent_id = (rest.parent_id === "" || rest.parent_id === "none") ? null : rest.parent_id;
       if (rest.due_date)    body.due_date = evalDate(rest.due_date);
       if (rest.due_string)  body.due_string = rest.due_string;
-      return todoistReq(tt, "POST", `/tasks/${task_id}`, body);
+      if (Object.keys(body).length > 0) {
+        await todoistReq(tt, "POST", `/tasks/${task_id}`, body);
+      }
+      if (rest.section_id) {
+        await todoistSync(tt, [{ type: "item_move", uuid: crypto.randomUUID(), args: { id: task_id, section_id: rest.section_id } }]);
+      }
+      return { success: true, task_id };
   },
 
   t_close_task: async (args, { tt }) => {
@@ -621,7 +626,6 @@ const TOOL_HANDLERS = {
               if (op.labels)      body.labels = op.labels;
               if (op.priority !== undefined) body.priority = op.priority;
               if (op.description) body.description = op.description;
-              if (op.section_id)  body.section_id = op.section_id;
               if (op.project_id)  body.project_id = op.project_id;
               if (op.parent_id !== undefined) body.parent_id = (op.parent_id === "" || op.parent_id === "none") ? null : op.parent_id;
               if (op.due_date)    body.due_date = evalDate(op.due_date);
@@ -631,6 +635,9 @@ const TOOL_HANDLERS = {
               // Only call REST if there are non-order fields to update
               if (Object.keys(body).length > 0) {
                 await todoistReq(tt, "POST", `/tasks/${op.task_id}`, body);
+              }
+              if (op.section_id) {
+                await todoistSync(tt, [{ type: "item_move", uuid: crypto.randomUUID(), args: { id: op.task_id, section_id: op.section_id } }]);
               }
               return { idx, action: "update", task_id: op.task_id, ok: true };
             }
