@@ -8,6 +8,7 @@ import {
   compactProject, toTSV, formatTodoistList, todoistReq, todoistSync,
 } from "./todoist.js";
 import { verifyToken } from "./oauth.js";
+import { handleItemCompleted } from "./webhook.js";
 import { TOOLS } from "./tools.js";
 
 const MCP_VERSION = "2024-11-05";
@@ -550,8 +551,19 @@ const TOOL_HANDLERS = {
 
   t_close_task: async (args, { tt }) => {
     assertTodoistId(args.task_id, "task_id");
+    // Fetch task before closing to get content/section/parent for renumber
+    const task = await todoistReq(tt, "GET", `/tasks/${args.task_id}`);
     await todoistReq(tt, "POST", `/tasks/${args.task_id}/close`);
-    return { success: true, task_id: args.task_id };
+    const result = { success: true, task_id: args.task_id };
+    // Auto-renumber if sequential task
+    if (task?.content && /^#\d+\s/.test(task.content) && task.section_id) {
+      const renumber = await handleItemCompleted(
+        { event_data: { content: task.content, section_id: task.section_id, parent_id: task.parent_id ?? null } },
+        tt,
+      );
+      result.renumber = renumber;
+    }
+    return result;
   },
 
   t_reopen_task: async (args, { tt }) => {
@@ -644,8 +656,16 @@ const TOOL_HANDLERS = {
             case "close": {
               if (!op.task_id) throw new Error("task_id required for close");
               assertTodoistId(op.task_id, "task_id");
+              const task = await todoistReq(tt, "GET", `/tasks/${op.task_id}`);
               await todoistReq(tt, "POST", `/tasks/${op.task_id}/close`);
-              return { idx, action: "close", task_id: op.task_id, ok: true };
+              const res = { idx, action: "close", task_id: op.task_id, ok: true };
+              if (task?.content && /^#\d+\s/.test(task.content) && task.section_id) {
+                res.renumber = await handleItemCompleted(
+                  { event_data: { content: task.content, section_id: task.section_id, parent_id: task.parent_id ?? null } },
+                  tt,
+                );
+              }
+              return res;
             }
             case "delete": {
               if (!op.task_id) throw new Error("task_id required for delete");

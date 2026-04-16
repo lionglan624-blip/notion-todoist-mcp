@@ -40,7 +40,7 @@ async function verifyTodoistSig(rawBody, sigHeader, secret) {
   return diff === 0;
 }
 
-async function handleItemCompleted(event, token) {
+export async function handleItemCompleted(event, token) {
   const data = event?.event_data ?? {};
   const content = data.content;
   if (typeof content !== "string" || !SEQ_CONTENT_RE.test(content)) {

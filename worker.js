@@ -50,6 +50,7 @@ export default {
       return jsonResp({ status: "ok", tools: TOOLS.length });
     }
 
+
     return new Response("Notion + Todoist MCP Server", { status: 200 });
   },
 
