@@ -3,9 +3,21 @@ main = "worker.js"
 compatibility_date = "2024-11-01"
 
 # Secrets are set via CLI (not stored here):
-#   wrangler secret put NOTION_TOKEN
-#   wrangler secret put TODOIST_TOKEN
+#   wrangler secret put NOTION_TOKEN            ← Notion integration token
+#   wrangler secret put TODOIST_TOKEN           ← Todoist API token (also used by cron + webhook)
+#   wrangler secret put TODOIST_WEBHOOK_SECRET  ← Todoist app client_secret, for /webhook/todoist HMAC verify
+
+# Daily cron at UTC 00:00 == JST 09:00. Drives runDailyNextLabels in src/cron.js
+# (adds/removes the `next` label based on due date; see CLAUDE.md § Automation).
+[triggers]
+crons = ["0 0 * * *"]
 
 [vars]
 NOTION_DB_IDS = '{"state":"6492f29c6eee4437af8acb5be76b5654","metrics":"724d65c928b94a6d8d1ad8a7f685178f","events":"8282de48503247bc89481c507b4fec74","food_master":"6442450befed40dc94d3fed7a8411157","habits_page":"3345c9c885a3812c906ec0e1012fd69f"}'
 TODOIST_CONFIG = '{"inbox_project_id":"6g8v9q87rGcggMM6"}'
+
+# OAuth state: authorization-code single-use + refresh-token rotation.
+# Keys: code:<jti> (TTL 5min), rt:<jti> (TTL 30d), fam:<fam> (TTL 30d, reuse poison).
+[[kv_namespaces]]
+binding = "OAUTH_STATE"
+id = "7a680d3a7e2949cc9deaf3f998325adf"

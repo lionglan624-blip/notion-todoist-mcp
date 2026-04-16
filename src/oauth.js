@@ -273,6 +273,9 @@ export async function handleAuthorize(request, url, env) {
       // to this MCP resource URL. Prevents tokens from ever being
       // unscoped in case this Worker is ever paired with another RS.
       aud: p.resource || `${url.origin}/mcp`,
+      // Unique ID enforced by KV on /token — makes codes single-use
+      // (RFC 6749 §4.1.2). Without jti the code would only be time-bound.
+      jti: crypto.randomUUID(),
     }, env);
     const redirect = new URL(p.redirect_uri);
     redirect.searchParams.set("code", code);
@@ -301,8 +304,19 @@ export async function handleToken(request, env) {
   }
 }
 
+// KV TTLs (seconds). Codes live 5 min; refresh tokens + family poison live
+// 30 days — same as the refresh token itself so the state expires in lockstep.
+const CODE_USED_TTL = 300;
+const RT_USED_TTL = 60 * 60 * 24 * 30;
+
 async function handleTokenInner(request, env) {
   if (request.method !== "POST") return new Response("Method Not Allowed", { status: 405 });
+  // OAUTH_STATE (KV) is required: enforces single-use codes and refresh
+  // rotation with reuse detection. Fail closed rather than silently
+  // degrading to the old stateless-but-replayable behaviour.
+  if (!env.OAUTH_STATE) {
+    return oauthJson({ error: "server_error", error_description: "OAUTH_STATE KV binding missing" }, 500);
+  }
   const form = await request.formData();
   const grant = form.get("grant_type");
   const now = Math.floor(Date.now() / 1000);
@@ -327,7 +341,19 @@ async function handleTokenInner(request, env) {
     }
     const challenge = await sha256b64u(verifier ?? "");
     if (challenge !== payload.cc) return oauthJson({ error: "invalid_grant" }, 400);
+    // Single-use enforcement (RFC 6749 §4.1.2). Reject any pre-jti legacy
+    // codes that slip in after the KV rollout — they cannot be proven unused.
+    if (!payload.jti) return oauthJson({ error: "invalid_grant" }, 400);
+    const codeKey = `code:${payload.jti}`;
+    if (await env.OAUTH_STATE.get(codeKey)) {
+      return oauthJson({ error: "invalid_grant" }, 400);
+    }
+    await env.OAUTH_STATE.put(codeKey, "1", { expirationTtl: CODE_USED_TTL });
     const aud = payload.aud || resource || null;
+    // New refresh-token family. `fam` travels with every rotated refresh
+    // so reuse detection can poison the entire lineage, not just one jti.
+    const fam = crypto.randomUUID();
+    const rtJti = crypto.randomUUID();
     const access = await signToken({
       typ: "access",
       exp: now + 3600,
@@ -336,9 +362,11 @@ async function handleTokenInner(request, env) {
     }, env);
     const refresh = await signToken({
       typ: "refresh",
-      exp: now + 60 * 60 * 24 * 30,
+      exp: now + RT_USED_TTL,
       ci: payload.ci,
       ...(aud ? { aud } : {}),
+      jti: rtJti,
+      fam,
     }, env);
     return oauthJson({
       access_token: access,
@@ -358,16 +386,43 @@ async function handleTokenInner(request, env) {
     if (resource && payload.aud && resource !== payload.aud) {
       return oauthJson({ error: "invalid_target" }, 400);
     }
+    // Refresh-token rotation with reuse detection (RFC 6749 §10.4 /
+    // RFC 6819 §5.2.2.3). Legacy tokens without jti/fam are rejected —
+    // the user can re-auth via /authorize.
+    if (!payload.jti || !payload.fam) return oauthJson({ error: "invalid_grant" }, 400);
+    const famKey = `fam:${payload.fam}`;
+    if (await env.OAUTH_STATE.get(famKey)) {
+      return oauthJson({ error: "invalid_grant" }, 400);
+    }
+    const rtKey = `rt:${payload.jti}`;
+    if (await env.OAUTH_STATE.get(rtKey)) {
+      // Reuse detected — poison the whole family so whichever party
+      // (legit user OR attacker) kept using the rotated token can't
+      // continue. Both will need to re-auth.
+      await env.OAUTH_STATE.put(famKey, "1", { expirationTtl: RT_USED_TTL });
+      return oauthJson({ error: "invalid_grant" }, 400);
+    }
+    await env.OAUTH_STATE.put(rtKey, "1", { expirationTtl: RT_USED_TTL });
+    const newJti = crypto.randomUUID();
     const access = await signToken({
       typ: "access",
       exp: now + 3600,
       ci: payload.ci,
       ...(payload.aud ? { aud: payload.aud } : {}),
     }, env);
+    const refresh = await signToken({
+      typ: "refresh",
+      exp: now + RT_USED_TTL,
+      ci: payload.ci,
+      ...(payload.aud ? { aud: payload.aud } : {}),
+      jti: newJti,
+      fam: payload.fam,
+    }, env);
     return oauthJson({
       access_token: access,
       token_type: "Bearer",
       expires_in: 3600,
+      refresh_token: refresh,
       scope: "mcp",
     });
   }
