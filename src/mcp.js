@@ -1300,8 +1300,21 @@ async function runMetricsSeries(args, { env, nt }) {
   // limit first then tail, so `limit:200 + tail:5` means "the 5 latest entries
   // within the oldest 200". Stats and last_flag use whatever the final slice
   // contains (last entry of the returned series = the value being flagged).
-  if (args.limit && Number.isFinite(args.limit)) series = series.slice(0, args.limit);
-  if (args.tail && Number.isFinite(args.tail)) series = series.slice(-args.tail);
+  //
+  // Coerce via Number() rather than gating on Number.isFinite(args.x) directly
+  // — some MCP-client serializations send a schema-declared `number` as a JSON
+  // string ("2" rather than 2), and strict isFinite would silently no-op. The
+  // 2026-05-28 tail:N regression was exactly this. The coercion still rejects
+  // NaN / Infinity / non-positive values, just via the post-Number check.
+  const toPosInt = (v) => {
+    if (v === undefined || v === null) return null;
+    const n = Math.floor(Number(v));
+    return Number.isFinite(n) && n > 0 ? n : null;
+  };
+  const limitN = toPosInt(args.limit);
+  const tailN = toPosInt(args.tail);
+  if (limitN !== null) series = series.slice(0, limitN);
+  if (tailN !== null) series = series.slice(-tailN);
 
   const nums = series.map(s => s["値"]).filter(n => typeof n === "number" && !isNaN(n));
   const stats = computeSeriesStats(nums);
