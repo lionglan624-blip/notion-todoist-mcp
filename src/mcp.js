@@ -1033,8 +1033,16 @@ function resolveMetricsId(args, env) {
 
 // Query the Metrics DB for all rows whose エントリ title begins with `${iso}_`.
 // One filtered query (paginated) replaces N per-entry collision checks. Returns
-// { map: title -> {id,url}, subrequests } so the caller can keep its budget tally.
-async function fetchMetricsByDatePrefix(token, dbId, iso) {
+// { map: canonicalTitle -> {id,url,raw_title?}, subrequests } so the caller can
+// keep its budget tally.
+//
+// Dedup key is derived from the 指標 SELECT value, not the literal title:
+// 04-02 legacy rows have abbreviated titles (e.g. `2025-02-12_Cr`) while their
+// select column holds the canonical name (クレアチニン). Title-keyed dedup
+// would miss those and silently produce duplicates on re-import. Aliases are
+// applied to the select value too, defending against rows whose select itself
+// drifted from the canonical name.
+async function fetchMetricsByDatePrefix(token, dbId, iso, aliases) {
   const prefix = `${iso}_`;
   const map = new Map();
   let subrequests = 0;
@@ -1048,9 +1056,15 @@ async function fetchMetricsByDatePrefix(token, dbId, iso) {
     const res = await notionReq(token, "POST", `/databases/${dbId}/query`, body);
     subrequests++;
     for (const p of res.results) {
+      const selectName = p.properties["指標"]?.select?.name;
+      if (!selectName) continue;
+      const canonical = normalizeMetricName(selectName, aliases);
+      const key = `${iso}_${canonical}`;
       const titleProp = p.properties["エントリ"];
-      const title = titleProp?.title?.map(t => t.plain_text).join("") || null;
-      if (title) map.set(title, { id: p.id, url: p.url });
+      const rawTitle = titleProp?.title?.map(t => t.plain_text).join("") || null;
+      // On the off chance the DB has stale duplicate rows for the same
+      // (date, metric), keep the first one so upsert/skip has a stable target.
+      if (!map.has(key)) map.set(key, { id: p.id, url: p.url, raw_title: rawTitle });
     }
     cursor = res.has_more ? res.next_cursor : null;
   } while (cursor);
@@ -1092,11 +1106,19 @@ async function runBulkMetrics(args, { env, nt }) {
   let existing = new Map();
   let spent = 0;
   if (mode !== "create") {
-    const lookup = await fetchMetricsByDatePrefix(nt, metricsId, iso);
+    const lookup = await fetchMetricsByDatePrefix(nt, metricsId, iso, aliases);
     existing = lookup.map;
     spent += lookup.subrequests;
   }
 
+  // Tracks canonical titles already processed in THIS call. Separate from
+  // `existing` (which means "lives in DB") so we can collapse in-batch
+  // duplicates to a single write under upsert (previously the 2nd occurrence
+  // re-ran update, costing a subrequest and skewing the updated count).
+  // First-wins semantic: the earliest entry writes; subsequent same-title
+  // entries return status:"skipped" + reason:"duplicate_in_batch". Mode
+  // "create" preserves legacy duplicate-prone behavior unchanged.
+  const handledInCall = new Set();
   const results = [];
   let i = startIdx;
   for (; i < entries.length; i++) {
@@ -1104,13 +1126,27 @@ async function runBulkMetrics(args, { env, nt }) {
     const rawMetric = e["指標"];
     const metric = normalizeMetricName(rawMetric, aliases);
     const title = `${iso}_${metric}`;
+
+    if (mode !== "create" && handledInCall.has(title)) {
+      const found = existing.get(title);
+      const row = {
+        index: i, status: "skipped", reason: "duplicate_in_batch", ok: true, title,
+        ...(found && { id: found.id, url: found.url }),
+      };
+      if (rawMetric !== metric) row.normalized_from = rawMetric;
+      results.push(row);
+      continue;
+    }
+
     const found = existing.get(title);
 
     // Skip path costs 0 subrequests.
     if (found && mode === "skip_existing") {
       const row = { index: i, status: "skipped", ok: true, id: found.id, url: found.url, title };
+      if (found.raw_title && found.raw_title !== title) row.matched_raw_title = found.raw_title;
       if (rawMetric !== metric) row.normalized_from = rawMetric;
       results.push(row);
+      handledInCall.add(title);
       continue;
     }
 
@@ -1125,20 +1161,22 @@ async function runBulkMetrics(args, { env, nt }) {
       if (found && mode === "upsert") {
         const p = await notionReq(nt, "PATCH", `/pages/${found.id}`, { properties: props });
         row = { index: i, status: "updated", ok: true, id: p.id, url: p.url, title };
+        if (found.raw_title && found.raw_title !== title) row.matched_raw_title = found.raw_title;
       } else {
         const p = await notionReq(nt, "POST", "/pages", {
           parent: { database_id: metricsId },
           properties: props,
         });
         row = { index: i, status: "created", ok: true, id: p.id, url: p.url, title };
-        // Future entries in this same call see the just-created page — guards
-        // against duplicate metric names inside one entries[] under skip/upsert.
         existing.set(title, { id: p.id, url: p.url });
       }
       if (rawMetric !== metric) row.normalized_from = rawMetric;
       results.push(row);
+      handledInCall.add(title);
       spent += 1;
     } catch (err) {
+      // Intentionally NOT marking the title as handled — the caller may want
+      // to retry, and a transient 5xx shouldn't poison subsequent entries.
       results.push({ index: i, status: "error", ok: false, error: err.message, title });
       spent += 1;
     }
