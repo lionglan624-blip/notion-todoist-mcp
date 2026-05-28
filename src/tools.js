@@ -333,12 +333,16 @@ export const TOOLS = [
     name: "n_metrics_series",
     description:
       "Trend-read sugar over the 📊 Metrics DB: fetch a single 指標 series with summary stats in one call. " +
-      "n_metrics_series({metric, from?, to?, limit?}) → {指標, count, series:[{date,値,単位?,メモ?}], stats:{first,last,delta,min,max,avg,median,count}, ref?, last_flag?}. " +
+      "n_metrics_series({metric, from?, to?, limit?, tail?}) → {指標, count, series:[{date,値,単位?,メモ?}], stats:{first,last,delta,min,max,avg,median,count}, ref?, last_flag?}. " +
       "(Input key is ASCII `metric` because the Anthropic tool-use API requires ASCII property keys; Japanese `指標` is also accepted as a fallback. Response keys mirror the Notion property names.) " +
       "Replaces the n_query → filter → sorts → stats boilerplate. " +
       "from / to accept date expressions (today, today-30d, today-1y, …) or ISO dates; both optional. " +
-      "Sorted ascending by 日付. metric is normalized via METRIC_ALIASES env var (same as n_bulk_metrics). " +
-      "When METRIC_RANGES env var defines [low, high] (either may be null) for the metric, the response includes ref:{low,high} plus last_flag:\"high\"|\"low\"|\"normal\" computed against the latest value. " +
+      "Series is sorted ASCENDING by 日付 (oldest first), regardless of slicing. " +
+      "limit:N = keep the first N entries (oldest N) — use this together with `from` for a windowed view. " +
+      "tail:N = keep the last N entries (latest N) while preserving chronological order — use this for \"give me the most recent N readings for trend display\". " +
+      "If both are set, limit applies first then tail (limit cuts head, tail cuts the resulting tail). Stats reflect whatever the final series contains. " +
+      "metric is normalized via METRIC_ALIASES env var (same as n_bulk_metrics). " +
+      "When METRIC_RANGES env var defines [low, high] (either may be null) for the metric, the response includes ref:{low,high} plus last_flag:\"high\"|\"low\"|\"normal\" computed against the final entry. " +
       "Auto-paginates up to 500 rows / 5 query pages.",
     inputSchema: {
       type: "object",
@@ -346,7 +350,8 @@ export const TOOLS = [
         metric: { type: "string", description: "Metric name (the 指標 select value); normalized via METRIC_ALIASES" },
         from: { type: "string", description: "Inclusive lower bound on 日付. Date expression or ISO date." },
         to: { type: "string", description: "Inclusive upper bound on 日付. Date expression or ISO date." },
-        limit: { type: "number", description: "Cap series length (after sort). Default: all up to 500." },
+        limit: { type: "number", description: "Keep the FIRST N entries (oldest N) after ascending sort. For \"latest N\" use `tail` instead. Default: all up to 500." },
+        tail: { type: "number", description: "Keep the LAST N entries (latest N) while preserving chronological order. Applied after `limit` if both are set." },
         database_id: { type: "string", description: "Override the Metrics DB id (default: NOTION_DB_IDS.metrics)" },
         format: { type: "string", enum: ["json", "tsv"], description: "Series formatting (stats are always JSON). Default: json" },
       },

@@ -1296,7 +1296,12 @@ async function runMetricsSeries(args, { env, nt }) {
       "メモ": props["メモ"] || null,
     };
   });
+  // limit = head N (oldest); tail = last N (latest). Both apply if set, with
+  // limit first then tail, so `limit:200 + tail:5` means "the 5 latest entries
+  // within the oldest 200". Stats and last_flag use whatever the final slice
+  // contains (last entry of the returned series = the value being flagged).
   if (args.limit && Number.isFinite(args.limit)) series = series.slice(0, args.limit);
+  if (args.tail && Number.isFinite(args.tail)) series = series.slice(-args.tail);
 
   const nums = series.map(s => s["値"]).filter(n => typeof n === "number" && !isNaN(n));
   const stats = computeSeriesStats(nums);
