@@ -1026,6 +1026,29 @@ function normalizeMetricName(raw, aliases) {
   return aliases[raw] || raw;
 }
 
+// METRIC_RANGES env var: { "<canonical_metric>": [low, high], ... }. Either
+// bound may be null for one-sided ranges (e.g. LDL upper-bound only:
+// `[null, 119]`; HDL lower-bound only: `[40, null]`). Keyed by canonical
+// (post-alias) names, since lookups happen after normalization.
+function parseMetricRanges(env) {
+  try { return JSON.parse(env.METRIC_RANGES || "{}"); } catch { return {}; }
+}
+
+function rangeBounds(range) {
+  if (!Array.isArray(range) || range.length < 2) return null;
+  const low = typeof range[0] === "number" && !isNaN(range[0]) ? range[0] : null;
+  const high = typeof range[1] === "number" && !isNaN(range[1]) ? range[1] : null;
+  if (low === null && high === null) return null;
+  return { low, high };
+}
+
+function flagValue(value, bounds) {
+  if (typeof value !== "number" || isNaN(value) || !bounds) return null;
+  if (bounds.low !== null && value < bounds.low) return "low";
+  if (bounds.high !== null && value > bounds.high) return "high";
+  return "normal";
+}
+
 function resolveMetricsId(args, env) {
   if (args.database_id) return args.database_id;
   try { return JSON.parse(env.NOTION_DB_IDS).metrics; } catch { return null; }
@@ -1123,7 +1146,13 @@ async function runBulkMetrics(args, { env, nt }) {
   let i = startIdx;
   for (; i < entries.length; i++) {
     const e = entries[i];
-    const rawMetric = e["指標"];
+    // Accept both ASCII (schema-canonical, required by the Anthropic tool-use
+    // API) and Japanese keys (the original API; some clients/conversations
+    // still use these). ASCII wins if both are present.
+    const rawMetric = e.metric ?? e["指標"];
+    const value = e.value ?? e["値"];
+    const unit = e.unit ?? e["単位"];
+    const memo = e.memo ?? e["メモ"];
     const metric = normalizeMetricName(rawMetric, aliases);
     const title = `${iso}_${metric}`;
 
@@ -1155,7 +1184,7 @@ async function runBulkMetrics(args, { env, nt }) {
 
     try {
       const props = resolvePropDates(normalizeProperties(
-        buildMetricsProps(iso, metric, e["値"], e["単位"], e["メモ"]),
+        buildMetricsProps(iso, metric, value, unit, memo),
       ));
       let row;
       if (found && mode === "upsert") {
@@ -1228,8 +1257,10 @@ async function runMetricsSeries(args, { env, nt }) {
   const metricsId = normalizeId(metricsIdRaw);
 
   const aliases = parseMetricAliases(env);
-  const rawMetric = args["指標"];
-  if (!rawMetric || typeof rawMetric !== "string") return { error: "指標 is required" };
+  // ASCII `metric` is the schema-canonical input; Japanese `指標` is also
+  // accepted as a fallback for clients still using the original API.
+  const rawMetric = args.metric ?? args["指標"];
+  if (!rawMetric || typeof rawMetric !== "string") return { error: "metric is required" };
   const metric = normalizeMetricName(rawMetric, aliases);
 
   const conds = [{ property: "指標", select: { equals: metric } }];
@@ -1270,6 +1301,14 @@ async function runMetricsSeries(args, { env, nt }) {
   const nums = series.map(s => s["値"]).filter(n => typeof n === "number" && !isNaN(n));
   const stats = computeSeriesStats(nums);
 
+  // Optional reference-range flagging via METRIC_RANGES. The field is omitted
+  // entirely when no range is configured for this metric — a "normal" flag
+  // would be misleading when there's nothing to compare against.
+  const ranges = parseMetricRanges(env);
+  const bounds = rangeBounds(ranges[metric]);
+  const last = nums.length ? nums[nums.length - 1] : null;
+  const last_flag = bounds ? flagValue(last, bounds) : null;
+
   const out = {
     "指標": metric,
     ...(rawMetric !== metric && { normalized_from: rawMetric }),
@@ -1278,6 +1317,8 @@ async function runMetricsSeries(args, { env, nt }) {
     has_more: cursor != null,
     series: args.format === "tsv" ? toTSV(series) : series,
     stats,
+    ...(bounds && { ref: bounds }),
+    ...(last_flag != null && { last_flag }),
   };
   return out;
 }

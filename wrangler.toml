@@ -21,6 +21,18 @@ TODOIST_CONFIG = '{"inbox_project_id":"6g8v9q87rGcggMM6"}'
 # intentionally NOT aliased — they are physically different measurements.
 METRIC_ALIASES = '{"γGT":"γGTP","Cr":"クレアチニン"}'
 
+# 指標 reference ranges: { "<canonical_name>": [low, high], ... }. Either
+# bound may be null for one-sided ranges (e.g. LDL has only an upper bound).
+# Consumed by n_metrics_series to attach ref + last_flag ("high"/"low"/"normal")
+# to the latest data point. Keyed by canonical (post-alias) names — synonyms
+# are normalized before lookup.
+#
+# Starter set: Japan-standard clinical cutoffs from typical 健診/人間ドック
+# printed reference values (JSH 2019 for BP, JSC for lipids, JDS for HbA1c,
+# JSN for eGFR, etc.). Adjust to match the printed range on YOUR lab report
+# or your personal targets — these are general adult-male defaults.
+METRIC_RANGES = '{"LDL":[null,119],"HDL":[40,null],"中性脂肪":[null,149],"総コレステロール":[140,199],"HbA1c":[null,5.5],"血糖":[70,99],"ALT":[null,30],"AST":[null,30],"γGTP":[null,50],"クレアチニン":[0.65,1.07],"eGFR":[60,null],"尿酸":[3.7,7.0],"収縮期血圧":[null,129],"拡張期血圧":[null,79],"BMI":[18.5,24.9],"腹囲":[null,84],"Hb":[13.5,17.0],"体脂肪率":[11,21]}'
+
 # OAuth state: authorization-code single-use + refresh-token rotation.
 # Keys: code:<jti> (TTL 5min), rt:<jti> (TTL 30d), fam:<fam> (TTL 30d, reuse poison).
 [[kv_namespaces]]

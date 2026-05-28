@@ -286,8 +286,9 @@ export const TOOLS = [
     name: "n_bulk_metrics",
     description:
       "Sugar over n_bulk for the 📊 Metrics DB: bulk-log many same-date metrics in one call. " +
-      "n_bulk_metrics({date, entries:[{指標, 値, 単位?, メモ?}], mode?}). " +
-      "Each entry becomes a write op: title エントリ=`YYYY-MM-DD_指標名`, 指標 (select, auto-created if new), 値 (number), 日付 (date), optional 単位/メモ (rich_text). " +
+      "n_bulk_metrics({date, entries:[{metric, value, unit?, memo?}], mode?}). " +
+      "Each entry writes a Metrics row with: エントリ title = `YYYY-MM-DD_<metric>`, 指標 select = <metric> (auto-created if new), 値 number = <value>, 日付 date = <date>, optional 単位/メモ rich_text = <unit>/<memo>. " +
+      "(Schema uses ASCII keys because the Anthropic tool-use API requires them; the Notion property names themselves stay Japanese. Japanese input keys 指標/値/単位/メモ are also accepted as a fallback.) " +
       "date accepts a date expression (today, today-7d, …) or ISO date. " +
       "mode (default \"create\" for backward compat): " +
       "\"create\" = always insert (may duplicate on re-runs); " +
@@ -295,7 +296,7 @@ export const TOOLS = [
       "\"skip_existing\" = leave the existing row untouched, return status:\"skipped\". " +
       "**Use \"skip_existing\" or \"upsert\" for backfills / re-runs** — \"create\" mode is duplicate-prone. " +
       "Returns per-entry status: \"created\" | \"updated\" | \"skipped\" | \"error\". " +
-      "指標 names are normalized via the optional METRIC_ALIASES env var (JSON map, e.g. {\"γGT\":\"γGTP\",\"Cr\":\"クレアチニン\"}) so synonyms don't fork the select. " +
+      "metric names are normalized via the optional METRIC_ALIASES env var (JSON map, e.g. {\"γGT\":\"γGTP\",\"Cr\":\"クレアチニン\"}) so synonyms don't fork the select. " +
       "Same subrequest-budget chunking + start_cursor continuation as n_bulk. " +
       "Defaults to NOTION_DB_IDS.metrics; override with database_id.",
     inputSchema: {
@@ -307,12 +308,12 @@ export const TOOLS = [
           items: {
             type: "object",
             properties: {
-              "指標": { type: "string", description: "Metric name (select value); normalized via METRIC_ALIASES if set" },
-              "値": { type: "number", description: "Numeric value" },
-              "単位": { type: "string", description: "Optional unit" },
-              "メモ": { type: "string", description: "Optional note" },
+              metric: { type: "string", description: "Metric name (becomes the 指標 select value; normalized via METRIC_ALIASES if set)" },
+              value: { type: "number", description: "Numeric value (becomes 値)" },
+              unit: { type: "string", description: "Optional unit (becomes 単位)" },
+              memo: { type: "string", description: "Optional note (becomes メモ)" },
             },
-            required: ["指標", "値"],
+            required: ["metric", "value"],
           },
         },
         mode: {
@@ -332,22 +333,24 @@ export const TOOLS = [
     name: "n_metrics_series",
     description:
       "Trend-read sugar over the 📊 Metrics DB: fetch a single 指標 series with summary stats in one call. " +
-      "n_metrics_series({指標, from?, to?, limit?}) → {指標, count, series:[{date,値,単位?,メモ?}], stats:{first,last,delta,min,max,avg,median,count}}. " +
+      "n_metrics_series({metric, from?, to?, limit?}) → {指標, count, series:[{date,値,単位?,メモ?}], stats:{first,last,delta,min,max,avg,median,count}, ref?, last_flag?}. " +
+      "(Input key is ASCII `metric` because the Anthropic tool-use API requires ASCII property keys; Japanese `指標` is also accepted as a fallback. Response keys mirror the Notion property names.) " +
       "Replaces the n_query → filter → sorts → stats boilerplate. " +
       "from / to accept date expressions (today, today-30d, today-1y, …) or ISO dates; both optional. " +
-      "Sorted ascending by 日付. 指標 is normalized via METRIC_ALIASES env var (same as n_bulk_metrics). " +
+      "Sorted ascending by 日付. metric is normalized via METRIC_ALIASES env var (same as n_bulk_metrics). " +
+      "When METRIC_RANGES env var defines [low, high] (either may be null) for the metric, the response includes ref:{low,high} plus last_flag:\"high\"|\"low\"|\"normal\" computed against the latest value. " +
       "Auto-paginates up to 500 rows / 5 query pages.",
     inputSchema: {
       type: "object",
       properties: {
-        "指標": { type: "string", description: "Metric name (select value); normalized via METRIC_ALIASES" },
+        metric: { type: "string", description: "Metric name (the 指標 select value); normalized via METRIC_ALIASES" },
         from: { type: "string", description: "Inclusive lower bound on 日付. Date expression or ISO date." },
         to: { type: "string", description: "Inclusive upper bound on 日付. Date expression or ISO date." },
         limit: { type: "number", description: "Cap series length (after sort). Default: all up to 500." },
         database_id: { type: "string", description: "Override the Metrics DB id (default: NOTION_DB_IDS.metrics)" },
         format: { type: "string", enum: ["json", "tsv"], description: "Series formatting (stats are always JSON). Default: json" },
       },
-      required: ["指標"],
+      required: ["metric"],
     },
   },
 
