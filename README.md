@@ -2,7 +2,7 @@
 
 A custom [MCP (Model Context Protocol)](https://modelcontextprotocol.io/) server running on Cloudflare Workers that provides Claude with full read/write access to Notion and Todoist. Protected by OAuth 2.1 for use with remote MCP clients.
 
-## Features (33 tools)
+## Features (35 tools)
 
 ### Todoist (18 tools)
 
@@ -23,7 +23,7 @@ A custom [MCP (Model Context Protocol)](https://modelcontextprotocol.io/) server
 | `t_create_section` / `t_update_section` / `t_delete_section` | Manage sections |
 | `t_get_labels` | List all personal labels |
 
-### Notion (10 tools)
+### Notion (12 tools)
 
 | Tool | Description |
 |------|-------------|
@@ -31,6 +31,8 @@ A custom [MCP (Model Context Protocol)](https://modelcontextprotocol.io/) server
 | `n_create_page` | Create a page with property shorthand and Markdown body |
 | `n_update_page` | Update properties, replace or append page body content (`archived:true` trashes the page) |
 | `n_delete_page` | Delete a page by archiving it (convenience wrapper; `restore:true` un-archives) |
+| `n_bulk` | Execute many create/update/delete ops in one call. Per-op results (partial failures don't abort); subrequest-budget aware with `start_cursor` continuation. Prefer over looping single calls for batch writes |
+| `n_bulk_metrics` | Sugar over `n_bulk` for the Metrics DB: log many same-date metrics at once (`{date, entries:[{指標, 値, 単位?, メモ?}]}`), auto-building the `YYYY-MM-DD_指標名` title and `指標`/`値`/`日付` properties |
 | `n_get_page` | Get a single page with all properties |
 | `n_get_blocks` | Get page body as plain text with heading markers (`##`/`###`/`####`) |
 | `n_get_schema` | Get database property schema |
@@ -55,7 +57,7 @@ A custom [MCP (Model Context Protocol)](https://modelcontextprotocol.io/) server
 - **Property shorthand** — `"text"` becomes `rich_text`, `123` becomes `number`, `true` becomes `checkbox`, `["a","b"]` becomes `multi_select`
 - **Markdown body** — Page content accepts Markdown (headings, bullets, numbered lists, code blocks, bold/italic/code inline)
 - **Rate limit handling** — Notion, Todoist REST, and Todoist Sync requests auto-retry on 429 with exponential backoff
-- **Bulk operations** — `t_bulk` runs up to 3 concurrent operations and batches reorders into a single Sync API call
+- **Bulk operations** — `t_bulk` runs up to 3 concurrent Todoist operations and batches reorders into a single Sync API call; `n_bulk` / `n_bulk_metrics` batch Notion writes within Cloudflare's per-invocation subrequest budget (`SUBREQUEST_BUDGET` env var, default 50), returning a `next_cursor` to continue when the budget is reached
 - **OAuth 2.1** — `/mcp` endpoint is protected; dynamic client registration + PKCE supported. Access tokens are audience-bound via [RFC 8707 resource indicators](https://datatracker.ietf.org/doc/html/rfc8707) when the client sends a `resource` parameter, so a token leaked to an unrelated MCP server cannot be replayed against this one.
 
 ### OAuth security tradeoffs

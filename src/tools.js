@@ -242,6 +242,79 @@ export const TOOLS = [
     },
   },
 
+  {
+    name: "n_bulk",
+    description:
+      "Execute multiple Notion operations in one call. ops: array of per-op objects. " +
+      "op:\"create\" {database_id, properties, content?} — same semantics as n_create_page (property shorthand + Markdown body). " +
+      "op:\"update\" {page_id, properties?, append_content?, replace_content?, archived?} — same as n_update_page. " +
+      "op:\"delete\" {page_id} — archives the page. " +
+      "Returns per-op results [{index, op, ok, id?, url?, error?}]; one failure does NOT abort the rest. " +
+      "Subrequest-budget aware: processes ops until the per-Worker-invocation budget (SUBREQUEST_BUDGET env var, default 50 = Cloudflare free tier) would be exceeded, then returns remaining + next_cursor. " +
+      "Re-call with start_cursor:<next_cursor> to continue — loop until remaining is absent. " +
+      "For full-body page replacement prefer delete + create over replace_content (which deletes blocks one-by-one and is budget-capped, leaving stale_blocks if the budget is hit).",
+    inputSchema: {
+      type: "object",
+      properties: {
+        ops: {
+          type: "array",
+          description: "Operations to execute in order.",
+          items: {
+            type: "object",
+            properties: {
+              op: { type: "string", enum: ["create", "update", "delete"] },
+              database_id: { type: "string", description: "Required for create" },
+              page_id: { type: "string", description: "Required for update/delete" },
+              properties: { type: "object", description: "Property shorthand (create/update)" },
+              content: { type: "string", description: "Markdown body (create)" },
+              append_content: { type: "string", description: "Markdown appended after existing blocks (update)" },
+              replace_content: { type: "string", description: "Markdown replacing the whole body (update) — prefer delete+create" },
+              archived: { type: "boolean", description: "true trashes the page (update)" },
+            },
+            required: ["op"],
+          },
+        },
+        start_cursor: { type: "number", description: "Resume from this op index (use the next_cursor from a prior call)" },
+        format: { type: "string", enum: ["json", "tsv"], description: "Result formatting. Default: json" },
+      },
+      required: ["ops"],
+    },
+  },
+
+  {
+    name: "n_bulk_metrics",
+    description:
+      "Sugar over n_bulk for the 📊 Metrics DB: bulk-log many same-date metrics in one call. " +
+      "n_bulk_metrics({date, entries:[{指標, 値, 単位?, メモ?}]}). " +
+      "Each entry becomes a create op: title エントリ=`YYYY-MM-DD_指標名`, 指標 (select, auto-created if new), 値 (number), 日付 (date), optional 単位/メモ (rich_text). " +
+      "date accepts a date expression (today, today-7d, …) or ISO date. " +
+      "Same subrequest-budget chunking + start_cursor continuation as n_bulk. " +
+      "Defaults to NOTION_DB_IDS.metrics; override with database_id.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        date: { type: "string", description: "Date expression or ISO date for 日付 and the エントリ title prefix" },
+        entries: {
+          type: "array",
+          items: {
+            type: "object",
+            properties: {
+              "指標": { type: "string", description: "Metric name (select value)" },
+              "値": { type: "number", description: "Numeric value" },
+              "単位": { type: "string", description: "Optional unit" },
+              "メモ": { type: "string", description: "Optional note" },
+            },
+            required: ["指標", "値"],
+          },
+        },
+        database_id: { type: "string", description: "Override the Metrics DB id (default: NOTION_DB_IDS.metrics)" },
+        start_cursor: { type: "number", description: "Resume from this entry index" },
+        format: { type: "string", enum: ["json", "tsv"], description: "Result formatting. Default: json" },
+      },
+      required: ["date", "entries"],
+    },
+  },
+
   // ── Utility ───────────────────────────────
   {
     name: "eval_date",

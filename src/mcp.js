@@ -288,6 +288,33 @@ const TOOL_HANDLERS = {
       return { id: p.id, url: p.url, archived: p.archived, last_edited_time: p.last_edited_time };
   },
 
+  n_bulk: async (args, ctx) => runNotionBulk(args.ops ?? [], ctx, args),
+
+  n_bulk_metrics: async (args, ctx) => {
+      const entries = args.entries ?? [];
+      if (!Array.isArray(entries) || !entries.length) return { error: "No entries provided" };
+      let metricsId = args.database_id;
+      if (!metricsId) {
+        try { metricsId = JSON.parse(ctx.env.NOTION_DB_IDS).metrics; } catch {}
+      }
+      if (!metricsId) return { error: "Metrics DB id not configured (NOTION_DB_IDS.metrics)" };
+      // Resolve the date once so the エントリ title prefix and the 日付 property agree.
+      const iso = evalDate(args.date);
+      const ops = entries.map((e) => {
+        const metric = e["指標"];
+        const props = {
+          "エントリ": { title: `${iso}_${metric}` },
+          "指標": { select: metric },
+          "値": e["値"],
+          "日付": { date: iso },
+        };
+        if (e["単位"] !== undefined && e["単位"] !== "") props["単位"] = e["単位"];
+        if (e["メモ"] !== undefined && e["メモ"] !== "") props["メモ"] = e["メモ"];
+        return { op: "create", database_id: metricsId, properties: props };
+      });
+      return runNotionBulk(ops, ctx, args);
+  },
+
   n_search: async (args, { nt }) => {
       // Page title lives under whichever property is typed "title" — the key
       // is not always "title" (often "Name" or a localized label), so scan.
@@ -835,6 +862,170 @@ const TOOL_HANDLERS = {
       };
   },
 };
+
+// ─────────────────────────────────────────────
+// n_bulk — multi-op Notion executor with Cloudflare subrequest budgeting.
+//
+// A single MCP tools/call is one Worker invocation, capped at SUBREQUEST_BUDGET
+// fetch subrequests (Cloudflare free tier = 50, paid = 1000). We estimate each
+// op's Notion-API call count up front and stop before the budget would be
+// exceeded, handing back {remaining, next_cursor} so the caller can continue in
+// a follow-up call. On the free tier this is the only way to write >~50 pages;
+// on paid it collapses to a single call. The token auth path does no fetch/KV
+// subrequests, so (nearly) the full budget is available to the handler.
+// ─────────────────────────────────────────────
+const mdBlockCount = (md) => (md ? mdToBlocks(md).length : 0);
+
+function estimateOpCost(op, budget) {
+  if (op.op === "delete") return 1;
+  if (op.op === "create") {
+    const overflow = Math.max(0, mdBlockCount(op.content) - NOTION_CHILDREN_BATCH);
+    return 1 + Math.ceil(overflow / NOTION_CHILDREN_BATCH);
+  }
+  if (op.op === "update") {
+    // replace_content's cost depends on the page's existing block count, which
+    // we can't know statically. Charge it the full budget so it always starts
+    // its own batch — the in-op hard cap then governs the delete-storm.
+    if (op.replace_content !== undefined) return budget;
+    let c = (op.properties || op.archived !== undefined) ? 1 : 0;
+    if (op.append_content) c += Math.ceil(mdBlockCount(op.append_content) / NOTION_CHILDREN_BATCH);
+    return Math.max(1, c);
+  }
+  return 1;
+}
+
+// Execute one op. Returns a result row plus __cost = actual subrequests used,
+// so the caller can keep an accurate running budget tally. `spentBefore` is the
+// budget already consumed this invocation; replace_content's deletes stop once
+// spentBefore + in-op cost reaches `budget`.
+async function execNotionOp(op, idx, nt, budget, spentBefore) {
+  try {
+    switch (op.op) {
+      case "create": {
+        if (!op.database_id) throw new Error("database_id required for create");
+        const body = {
+          parent: { database_id: normalizeId(op.database_id) },
+          properties: resolvePropDates(normalizeProperties(op.properties)),
+        };
+        let overflow = [];
+        if (op.content) {
+          const blocks = mdToBlocks(op.content);
+          if (blocks.length) {
+            body.children = blocks.slice(0, NOTION_CHILDREN_BATCH);
+            overflow = blocks.slice(NOTION_CHILDREN_BATCH);
+          }
+        }
+        const p = await notionReq(nt, "POST", "/pages", body);
+        let cost = 1;
+        if (overflow.length) {
+          await appendBlocksChunked(nt, p.id, overflow);
+          cost += Math.ceil(overflow.length / NOTION_CHILDREN_BATCH);
+        }
+        return { index: idx, op: "create", ok: true, id: p.id, url: p.url, __cost: cost };
+      }
+      case "delete": {
+        if (!op.page_id) throw new Error("page_id required for delete");
+        const pid = normalizeId(op.page_id);
+        const p = await notionReq(nt, "PATCH", `/pages/${pid}`, { archived: true });
+        return { index: idx, op: "delete", ok: true, id: p.id, url: p.url, __cost: 1 };
+      }
+      case "update": {
+        if (!op.page_id) throw new Error("page_id required for update");
+        const pid = normalizeId(op.page_id);
+        let cost = 0;
+        if (op.properties || op.archived !== undefined) {
+          const b = {};
+          if (op.properties) b.properties = resolvePropDates(normalizeProperties(op.properties));
+          if (op.archived !== undefined) b.archived = op.archived;
+          await notionReq(nt, "PATCH", `/pages/${pid}`, b);
+          cost += 1;
+        }
+        let staleBlocks = 0;
+        if (op.replace_content !== undefined) {
+          // Append new blocks FIRST (so a partial failure leaves old content
+          // intact), then delete old blocks — but never past the budget.
+          const oldBlocks = [];
+          let cursor;
+          do {
+            const qs = cursor ? `?page_size=100&start_cursor=${cursor}` : `?page_size=100`;
+            const page = await notionReq(nt, "GET", `/blocks/${pid}/children${qs}`);
+            cost += 1;
+            oldBlocks.push(...page.results);
+            cursor = page.has_more ? page.next_cursor : null;
+          } while (cursor);
+          const newBlocks = mdToBlocks(op.replace_content);
+          if (newBlocks.length) {
+            await appendBlocksChunked(nt, pid, newBlocks);
+            cost += Math.ceil(newBlocks.length / NOTION_CHILDREN_BATCH);
+          }
+          for (const blk of oldBlocks) {
+            if (spentBefore + cost >= budget) { staleBlocks++; continue; }
+            try { await notionReq(nt, "DELETE", `/blocks/${blk.id}`); cost += 1; }
+            catch { staleBlocks++; }
+          }
+        }
+        if (op.append_content) {
+          const blocks = mdToBlocks(op.append_content);
+          if (blocks.length) {
+            await appendBlocksChunked(nt, pid, blocks);
+            cost += Math.ceil(blocks.length / NOTION_CHILDREN_BATCH);
+          }
+        }
+        const r = { index: idx, op: "update", ok: true, id: pid, __cost: Math.max(1, cost) };
+        if (staleBlocks > 0) {
+          r.stale_blocks = staleBlocks;
+          r.warning = `${staleBlocks} old block(s) left undeleted (subrequest budget reached). ` +
+            `Prefer delete+create for full-body replacement, or re-run to finish cleanup.`;
+        }
+        return r;
+      }
+      default:
+        throw new Error(`Unknown op: ${op.op}`);
+    }
+  } catch (e) {
+    return { index: idx, op: op.op, ok: false, error: e.message, __cost: 1 };
+  }
+}
+
+async function runNotionBulk(ops, { env, nt }, args = {}) {
+  if (!Array.isArray(ops) || !ops.length) return { error: "No operations provided" };
+
+  const budget = Math.max(1, Number(env.SUBREQUEST_BUDGET) || 50);
+  const startIdx = Math.max(0, Math.floor(Number(args.start_cursor) || 0));
+
+  let spent = 0;
+  let i = startIdx;
+  const results = [];
+  for (; i < ops.length; i++) {
+    const est = estimateOpCost(ops[i], budget);
+    // Defer the rest to a continuation call once the budget would be exceeded.
+    // The first op of a batch always runs even if it alone is expensive.
+    if (spent > 0 && spent + est > budget) break;
+    const r = await execNotionOp(ops[i], i, nt, budget, spent);
+    spent += r.__cost ?? est;
+    delete r.__cost;
+    results.push(r);
+  }
+
+  const remaining = ops.length - i;
+  const succeeded = results.filter(r => r.ok).length;
+  const failed = results.length - succeeded;
+  const out = {
+    total: ops.length,
+    processed: results.length,
+    succeeded,
+    failed,
+    ...(failed > 0 && { partial_failure: true }),
+    ...(remaining > 0 && {
+      remaining,
+      next_cursor: i,
+      note: `Subrequest budget (${budget}) reached after ${results.length} op(s). ` +
+        `Re-call with start_cursor:${i} to process the remaining ${remaining}.`,
+    }),
+    results: args.format === "tsv" ? toTSV(results) : results,
+  };
+  return out;
+}
 
 async function runTool(env, name, args) {
   const handler = TOOL_HANDLERS[name];
