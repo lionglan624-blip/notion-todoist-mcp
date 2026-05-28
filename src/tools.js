@@ -245,7 +245,8 @@ export const TOOLS = [
   {
     name: "n_bulk",
     description:
-      "Execute multiple Notion operations in one call. ops: array of per-op objects. " +
+      "Execute multiple Notion operations in one call. " +
+      "Accepts `ops` (preferred) or `operations` (alias of t_bulk for cross-tool ergonomics); each item accepts `op` or `action`. " +
       "op:\"create\" {database_id, properties, content?} — same semantics as n_create_page (property shorthand + Markdown body). " +
       "op:\"update\" {page_id, properties?, append_content?, replace_content?, archived?} — same as n_update_page. " +
       "op:\"delete\" {page_id} — archives the page. " +
@@ -258,11 +259,12 @@ export const TOOLS = [
       properties: {
         ops: {
           type: "array",
-          description: "Operations to execute in order.",
+          description: "Operations to execute in order. Alias: `operations`.",
           items: {
             type: "object",
             properties: {
-              op: { type: "string", enum: ["create", "update", "delete"] },
+              op: { type: "string", enum: ["create", "update", "delete"], description: "Alias: `action`" },
+              action: { type: "string", enum: ["create", "update", "delete"], description: "Alias of `op` for t_bulk parity" },
               database_id: { type: "string", description: "Required for create" },
               page_id: { type: "string", description: "Required for update/delete" },
               properties: { type: "object", description: "Property shorthand (create/update)" },
@@ -271,13 +273,12 @@ export const TOOLS = [
               replace_content: { type: "string", description: "Markdown replacing the whole body (update) — prefer delete+create" },
               archived: { type: "boolean", description: "true trashes the page (update)" },
             },
-            required: ["op"],
           },
         },
+        operations: { type: "array", description: "Alias of `ops` (for symmetry with t_bulk)." },
         start_cursor: { type: "number", description: "Resume from this op index (use the next_cursor from a prior call)" },
         format: { type: "string", enum: ["json", "tsv"], description: "Result formatting. Default: json" },
       },
-      required: ["ops"],
     },
   },
 
@@ -285,9 +286,16 @@ export const TOOLS = [
     name: "n_bulk_metrics",
     description:
       "Sugar over n_bulk for the 📊 Metrics DB: bulk-log many same-date metrics in one call. " +
-      "n_bulk_metrics({date, entries:[{指標, 値, 単位?, メモ?}]}). " +
-      "Each entry becomes a create op: title エントリ=`YYYY-MM-DD_指標名`, 指標 (select, auto-created if new), 値 (number), 日付 (date), optional 単位/メモ (rich_text). " +
+      "n_bulk_metrics({date, entries:[{指標, 値, 単位?, メモ?}], mode?}). " +
+      "Each entry becomes a write op: title エントリ=`YYYY-MM-DD_指標名`, 指標 (select, auto-created if new), 値 (number), 日付 (date), optional 単位/メモ (rich_text). " +
       "date accepts a date expression (today, today-7d, …) or ISO date. " +
+      "mode (default \"create\" for backward compat): " +
+      "\"create\" = always insert (may duplicate on re-runs); " +
+      "\"upsert\" = update if a row with the same エントリ title already exists, else create; " +
+      "\"skip_existing\" = leave the existing row untouched, return status:\"skipped\". " +
+      "**Use \"skip_existing\" or \"upsert\" for backfills / re-runs** — \"create\" mode is duplicate-prone. " +
+      "Returns per-entry status: \"created\" | \"updated\" | \"skipped\" | \"error\". " +
+      "指標 names are normalized via the optional METRIC_ALIASES env var (JSON map, e.g. {\"γGT\":\"γGTP\",\"Cr\":\"クレアチニン\"}) so synonyms don't fork the select. " +
       "Same subrequest-budget chunking + start_cursor continuation as n_bulk. " +
       "Defaults to NOTION_DB_IDS.metrics; override with database_id.",
     inputSchema: {
@@ -299,7 +307,7 @@ export const TOOLS = [
           items: {
             type: "object",
             properties: {
-              "指標": { type: "string", description: "Metric name (select value)" },
+              "指標": { type: "string", description: "Metric name (select value); normalized via METRIC_ALIASES if set" },
               "値": { type: "number", description: "Numeric value" },
               "単位": { type: "string", description: "Optional unit" },
               "メモ": { type: "string", description: "Optional note" },
@@ -307,11 +315,39 @@ export const TOOLS = [
             required: ["指標", "値"],
           },
         },
+        mode: {
+          type: "string",
+          enum: ["create", "upsert", "skip_existing"],
+          description: "Collision behavior when the エントリ title already exists. Default \"create\" (backward-compat). Use \"skip_existing\" or \"upsert\" for backfills.",
+        },
         database_id: { type: "string", description: "Override the Metrics DB id (default: NOTION_DB_IDS.metrics)" },
         start_cursor: { type: "number", description: "Resume from this entry index" },
         format: { type: "string", enum: ["json", "tsv"], description: "Result formatting. Default: json" },
       },
       required: ["date", "entries"],
+    },
+  },
+
+  {
+    name: "n_metrics_series",
+    description:
+      "Trend-read sugar over the 📊 Metrics DB: fetch a single 指標 series with summary stats in one call. " +
+      "n_metrics_series({指標, from?, to?, limit?}) → {指標, count, series:[{date,値,単位?,メモ?}], stats:{first,last,delta,min,max,avg,median,count}}. " +
+      "Replaces the n_query → filter → sorts → stats boilerplate. " +
+      "from / to accept date expressions (today, today-30d, today-1y, …) or ISO dates; both optional. " +
+      "Sorted ascending by 日付. 指標 is normalized via METRIC_ALIASES env var (same as n_bulk_metrics). " +
+      "Auto-paginates up to 500 rows / 5 query pages.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        "指標": { type: "string", description: "Metric name (select value); normalized via METRIC_ALIASES" },
+        from: { type: "string", description: "Inclusive lower bound on 日付. Date expression or ISO date." },
+        to: { type: "string", description: "Inclusive upper bound on 日付. Date expression or ISO date." },
+        limit: { type: "number", description: "Cap series length (after sort). Default: all up to 500." },
+        database_id: { type: "string", description: "Override the Metrics DB id (default: NOTION_DB_IDS.metrics)" },
+        format: { type: "string", enum: ["json", "tsv"], description: "Series formatting (stats are always JSON). Default: json" },
+      },
+      required: ["指標"],
     },
   },
 

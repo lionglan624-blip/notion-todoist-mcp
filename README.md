@@ -2,7 +2,7 @@
 
 A custom [MCP (Model Context Protocol)](https://modelcontextprotocol.io/) server running on Cloudflare Workers that provides Claude with full read/write access to Notion and Todoist. Protected by OAuth 2.1 for use with remote MCP clients.
 
-## Features (35 tools)
+## Features (36 tools)
 
 ### Todoist (18 tools)
 
@@ -23,7 +23,7 @@ A custom [MCP (Model Context Protocol)](https://modelcontextprotocol.io/) server
 | `t_create_section` / `t_update_section` / `t_delete_section` | Manage sections |
 | `t_get_labels` | List all personal labels |
 
-### Notion (12 tools)
+### Notion (13 tools)
 
 | Tool | Description |
 |------|-------------|
@@ -31,8 +31,9 @@ A custom [MCP (Model Context Protocol)](https://modelcontextprotocol.io/) server
 | `n_create_page` | Create a page with property shorthand and Markdown body |
 | `n_update_page` | Update properties, replace or append page body content (`archived:true` trashes the page) |
 | `n_delete_page` | Delete a page by archiving it (convenience wrapper; `restore:true` un-archives) |
-| `n_bulk` | Execute many create/update/delete ops in one call. Per-op results (partial failures don't abort); subrequest-budget aware with `start_cursor` continuation. Prefer over looping single calls for batch writes |
-| `n_bulk_metrics` | Sugar over `n_bulk` for the Metrics DB: log many same-date metrics at once (`{date, entries:[{指標, 値, 単位?, メモ?}]}`), auto-building the `YYYY-MM-DD_指標名` title and `指標`/`値`/`日付` properties |
+| `n_bulk` | Execute many create/update/delete ops in one call (`ops` or `operations`; each item accepts `op` or `action`). Per-op results (partial failures don't abort); subrequest-budget aware with `start_cursor` continuation. Prefer over looping single calls for batch writes |
+| `n_bulk_metrics` | Sugar over `n_bulk` for the Metrics DB: log many same-date metrics at once (`{date, entries:[{指標, 値, 単位?, メモ?}], mode?}`). `mode: "create"` (default) / `"upsert"` / `"skip_existing"` — use the latter two for backfills to avoid duplicates. `指標` names normalized via `METRIC_ALIASES` env var |
+| `n_metrics_series` | Trend-read sugar over the Metrics DB: one call returns `{series:[{date,値,…}], stats:{first,last,delta,min,max,avg,median,count}}` for a single 指標 with optional `from`/`to` date bounds. Replaces the n_query→filter→sorts→stats boilerplate |
 | `n_get_page` | Get a single page with all properties |
 | `n_get_blocks` | Get page body as plain text with heading markers (`##`/`###`/`####`) |
 | `n_get_schema` | Get database property schema |

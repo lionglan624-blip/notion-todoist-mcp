@@ -288,32 +288,16 @@ const TOOL_HANDLERS = {
       return { id: p.id, url: p.url, archived: p.archived, last_edited_time: p.last_edited_time };
   },
 
-  n_bulk: async (args, ctx) => runNotionBulk(args.ops ?? [], ctx, args),
-
-  n_bulk_metrics: async (args, ctx) => {
-      const entries = args.entries ?? [];
-      if (!Array.isArray(entries) || !entries.length) return { error: "No entries provided" };
-      let metricsId = args.database_id;
-      if (!metricsId) {
-        try { metricsId = JSON.parse(ctx.env.NOTION_DB_IDS).metrics; } catch {}
-      }
-      if (!metricsId) return { error: "Metrics DB id not configured (NOTION_DB_IDS.metrics)" };
-      // Resolve the date once so the エントリ title prefix and the 日付 property agree.
-      const iso = evalDate(args.date);
-      const ops = entries.map((e) => {
-        const metric = e["指標"];
-        const props = {
-          "エントリ": { title: `${iso}_${metric}` },
-          "指標": { select: metric },
-          "値": e["値"],
-          "日付": { date: iso },
-        };
-        if (e["単位"] !== undefined && e["単位"] !== "") props["単位"] = e["単位"];
-        if (e["メモ"] !== undefined && e["メモ"] !== "") props["メモ"] = e["メモ"];
-        return { op: "create", database_id: metricsId, properties: props };
-      });
+  n_bulk: async (args, ctx) => {
+      // Accept `ops` or `operations` (alias of t_bulk); each item accepts `op` or `action`.
+      const raw = args.ops ?? args.operations ?? [];
+      const ops = raw.map(o => o?.op ? o : (o?.action ? { ...o, op: o.action } : o));
       return runNotionBulk(ops, ctx, args);
   },
+
+  n_bulk_metrics: async (args, ctx) => runBulkMetrics(args, ctx),
+
+  n_metrics_series: async (args, ctx) => runMetricsSeries(args, ctx),
 
   n_search: async (args, { nt }) => {
       // Page title lives under whichever property is typed "title" — the key
@@ -1023,6 +1007,239 @@ async function runNotionBulk(ops, { env, nt }, args = {}) {
         `Re-call with start_cursor:${i} to process the remaining ${remaining}.`,
     }),
     results: args.format === "tsv" ? toTSV(results) : results,
+  };
+  return out;
+}
+
+// ─────────────────────────────────────────────
+// Metrics DB helpers (n_bulk_metrics + n_metrics_series).
+// METRIC_ALIASES env var ({ "γGT": "γGTP", … }) maps free-typed synonyms to the
+// canonical 指標 select value at write/read time — light-touch hygiene without
+// a full master DB.
+// ─────────────────────────────────────────────
+function parseMetricAliases(env) {
+  try { return JSON.parse(env.METRIC_ALIASES || "{}"); } catch { return {}; }
+}
+
+function normalizeMetricName(raw, aliases) {
+  if (typeof raw !== "string") return raw;
+  return aliases[raw] || raw;
+}
+
+function resolveMetricsId(args, env) {
+  if (args.database_id) return args.database_id;
+  try { return JSON.parse(env.NOTION_DB_IDS).metrics; } catch { return null; }
+}
+
+// Query the Metrics DB for all rows whose エントリ title begins with `${iso}_`.
+// One filtered query (paginated) replaces N per-entry collision checks. Returns
+// { map: title -> {id,url}, subrequests } so the caller can keep its budget tally.
+async function fetchMetricsByDatePrefix(token, dbId, iso) {
+  const prefix = `${iso}_`;
+  const map = new Map();
+  let subrequests = 0;
+  let cursor = null;
+  do {
+    const body = {
+      page_size: 100,
+      filter: { property: "エントリ", title: { starts_with: prefix } },
+    };
+    if (cursor) body.start_cursor = cursor;
+    const res = await notionReq(token, "POST", `/databases/${dbId}/query`, body);
+    subrequests++;
+    for (const p of res.results) {
+      const titleProp = p.properties["エントリ"];
+      const title = titleProp?.title?.map(t => t.plain_text).join("") || null;
+      if (title) map.set(title, { id: p.id, url: p.url });
+    }
+    cursor = res.has_more ? res.next_cursor : null;
+  } while (cursor);
+  return { map, subrequests };
+}
+
+function buildMetricsProps(iso, metric, value, unit, memo) {
+  const props = {
+    "エントリ": { title: `${iso}_${metric}` },
+    "指標": { select: metric },
+    "値": value,
+    "日付": { date: iso },
+  };
+  if (unit !== undefined && unit !== null && unit !== "") props["単位"] = unit;
+  if (memo !== undefined && memo !== null && memo !== "") props["メモ"] = memo;
+  return props;
+}
+
+async function runBulkMetrics(args, { env, nt }) {
+  const entries = args.entries ?? [];
+  if (!Array.isArray(entries) || !entries.length) return { error: "No entries provided" };
+
+  const metricsIdRaw = resolveMetricsId(args, env);
+  if (!metricsIdRaw) return { error: "Metrics DB id not configured (NOTION_DB_IDS.metrics)" };
+  const metricsId = normalizeId(metricsIdRaw);
+
+  const mode = args.mode || "create";
+  if (!["create", "upsert", "skip_existing"].includes(mode)) {
+    return { error: `Invalid mode: ${mode}. Use create | upsert | skip_existing.` };
+  }
+
+  const iso = evalDate(args.date);
+  const aliases = parseMetricAliases(env);
+  const budget = Math.max(1, Number(env.SUBREQUEST_BUDGET) || 50);
+  const startIdx = Math.max(0, Math.floor(Number(args.start_cursor) || 0));
+
+  // Pre-flight dedup query (skipped in pure "create" mode). Re-runs on every
+  // continuation call — costs 1-2 subrequests, negligible vs. the savings.
+  let existing = new Map();
+  let spent = 0;
+  if (mode !== "create") {
+    const lookup = await fetchMetricsByDatePrefix(nt, metricsId, iso);
+    existing = lookup.map;
+    spent += lookup.subrequests;
+  }
+
+  const results = [];
+  let i = startIdx;
+  for (; i < entries.length; i++) {
+    const e = entries[i];
+    const rawMetric = e["指標"];
+    const metric = normalizeMetricName(rawMetric, aliases);
+    const title = `${iso}_${metric}`;
+    const found = existing.get(title);
+
+    // Skip path costs 0 subrequests.
+    if (found && mode === "skip_existing") {
+      const row = { index: i, status: "skipped", ok: true, id: found.id, url: found.url, title };
+      if (rawMetric !== metric) row.normalized_from = rawMetric;
+      results.push(row);
+      continue;
+    }
+
+    // Write paths each cost 1 subrequest.
+    if (spent > 0 && spent + 1 > budget) break;
+
+    try {
+      const props = resolvePropDates(normalizeProperties(
+        buildMetricsProps(iso, metric, e["値"], e["単位"], e["メモ"]),
+      ));
+      let row;
+      if (found && mode === "upsert") {
+        const p = await notionReq(nt, "PATCH", `/pages/${found.id}`, { properties: props });
+        row = { index: i, status: "updated", ok: true, id: p.id, url: p.url, title };
+      } else {
+        const p = await notionReq(nt, "POST", "/pages", {
+          parent: { database_id: metricsId },
+          properties: props,
+        });
+        row = { index: i, status: "created", ok: true, id: p.id, url: p.url, title };
+        // Future entries in this same call see the just-created page — guards
+        // against duplicate metric names inside one entries[] under skip/upsert.
+        existing.set(title, { id: p.id, url: p.url });
+      }
+      if (rawMetric !== metric) row.normalized_from = rawMetric;
+      results.push(row);
+      spent += 1;
+    } catch (err) {
+      results.push({ index: i, status: "error", ok: false, error: err.message, title });
+      spent += 1;
+    }
+  }
+
+  const remaining = entries.length - i;
+  const counts = { created: 0, updated: 0, skipped: 0, error: 0 };
+  for (const r of results) counts[r.status] = (counts[r.status] || 0) + 1;
+  const out = {
+    total: entries.length,
+    processed: results.length,
+    mode,
+    ...counts,
+    ...(counts.error > 0 && { partial_failure: true }),
+    ...(remaining > 0 && {
+      remaining,
+      next_cursor: i,
+      note: `Subrequest budget (${budget}) reached after ${results.length} entr${results.length === 1 ? "y" : "ies"}. ` +
+        `Re-call with start_cursor:${i} to process the remaining ${remaining}.`,
+    }),
+    results: args.format === "tsv" ? toTSV(results) : results,
+  };
+  return out;
+}
+
+function computeSeriesStats(nums) {
+  if (!nums.length) return null;
+  const sorted = [...nums].sort((a, b) => a - b);
+  const sum = nums.reduce((a, b) => a + b, 0);
+  const mid = Math.floor(sorted.length / 2);
+  const median = sorted.length % 2 === 0
+    ? (sorted[mid - 1] + sorted[mid]) / 2
+    : sorted[mid];
+  return {
+    count: nums.length,
+    first: nums[0],
+    last: nums[nums.length - 1],
+    delta: nums[nums.length - 1] - nums[0],
+    min: sorted[0],
+    max: sorted[sorted.length - 1],
+    avg: sum / nums.length,
+    median,
+  };
+}
+
+async function runMetricsSeries(args, { env, nt }) {
+  const metricsIdRaw = resolveMetricsId(args, env);
+  if (!metricsIdRaw) return { error: "Metrics DB id not configured (NOTION_DB_IDS.metrics)" };
+  const metricsId = normalizeId(metricsIdRaw);
+
+  const aliases = parseMetricAliases(env);
+  const rawMetric = args["指標"];
+  if (!rawMetric || typeof rawMetric !== "string") return { error: "指標 is required" };
+  const metric = normalizeMetricName(rawMetric, aliases);
+
+  const conds = [{ property: "指標", select: { equals: metric } }];
+  if (args.from) conds.push({ property: "日付", date: { on_or_after: evalDate(args.from) } });
+  if (args.to)   conds.push({ property: "日付", date: { on_or_before: evalDate(args.to) } });
+  const filter = conds.length === 1 ? conds[0] : { and: conds };
+
+  // Auto-paginate, mirroring n_query's safety caps (500 rows / 5 pages).
+  const all = [];
+  let cursor = null;
+  let pages = 0;
+  while (true) {
+    const body = {
+      page_size: 100,
+      filter,
+      sorts: [{ property: "日付", direction: "ascending" }],
+    };
+    if (cursor) body.start_cursor = cursor;
+    if (pages > 0) await sleep(350);
+    const res = await notionReq(nt, "POST", `/databases/${metricsId}/query`, body);
+    pages++;
+    all.push(...res.results);
+    cursor = res.has_more ? res.next_cursor : null;
+    if (!cursor || all.length >= 500 || pages >= 5) break;
+  }
+
+  let series = all.map(p => {
+    const props = compactProps(p.properties);
+    return {
+      date: props["日付"] ?? null,
+      "値": props["値"] ?? null,
+      "単位": props["単位"] || null,
+      "メモ": props["メモ"] || null,
+    };
+  });
+  if (args.limit && Number.isFinite(args.limit)) series = series.slice(0, args.limit);
+
+  const nums = series.map(s => s["値"]).filter(n => typeof n === "number" && !isNaN(n));
+  const stats = computeSeriesStats(nums);
+
+  const out = {
+    "指標": metric,
+    ...(rawMetric !== metric && { normalized_from: rawMetric }),
+    count: series.length,
+    fetched_pages: pages,
+    has_more: cursor != null,
+    series: args.format === "tsv" ? toTSV(series) : series,
+    stats,
   };
   return out;
 }
