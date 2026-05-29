@@ -406,10 +406,13 @@ export const TOOLS = [
   // ── Utility ───────────────────────────────
   {
     name: "eval_date",
-    description: "Resolve a JST date expression to ISO date. Supports: today, yesterday, tomorrow, today+7d, today-30d, today+2w, today+1m, today+1y, now, week_start/week_end (Mon–Sun of this week), month_start/month_end.",
+    description: "Resolve a JST date expression to ISO date. Arg name is `expression` (alias `expr` also accepted). Supports: today, yesterday, tomorrow, today+7d, today-30d, today+2w, today+1m, today+1y, now, week_start/week_end (Mon–Sun of this week), month_start/month_end.",
     inputSchema: {
       type: "object",
-      properties: { expression: { type: "string" } },
+      properties: {
+        expression: { type: "string", description: "Date expression. Alias: `expr`." },
+        expr: { type: "string", description: "Alias of `expression`." },
+      },
       required: ["expression"],
     },
   },

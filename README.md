@@ -47,11 +47,11 @@ A custom [MCP (Model Context Protocol)](https://modelcontextprotocol.io/) server
 
 | Tool | Description |
 |------|-------------|
-| `eval_date` | Resolve JST date expressions (`today`, `today+7d`, `yesterday`, `today-2w`, `now`, `week_start`/`week_end` for this week's Mon–Sun, `month_start`/`month_end`, etc.) |
+| `eval_date` | Resolve JST date expressions (`today`, `today+7d`, `yesterday`, `today-2w`, `now`, `week_start`/`week_end` for this week's Mon–Sun, `month_start`/`month_end`, etc.). Arg `expression` (alias `expr`) |
 | `calculate` | Safe math evaluator with `Math.*` support (no `eval`) |
 | `stats` | Compute statistics (count, sum, avg, min, max, median, delta) from a number array |
 | `context` | Single-call conversation bootstrap. Fetches configured sources in parallel and always returns a `dates` block of JST-resolved anchors (today/now/week_start/week_end/month_start/month_end). Resolution: per-call args > `CONTEXT_CONFIG` env var > legacy defaults (`TODOIST_CONFIG.inbox_project_id` + `NOTION_DB_IDS.habits_page`). Supports `tasks`, `pages`, `extra_pages`, `queries` slots |
-| `help` | Return the full tool list (names + inputSchemas) plus static workspace config (pre-configured database/project IDs) |
+| `help` | Return the full tool list (names + inputSchemas) plus static workspace config (pre-configured database/project IDs) and `notion_db_title_props` — each configured DB's resolved title-property name (`ドメイン`/`タイトル`/`エントリ` differ per DB) so callers don't guess |
 
 ## Key Design Choices
 

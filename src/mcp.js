@@ -53,7 +53,13 @@ function suggestKey(name, knownKeys) {
 // ─────────────────────────────────────────────
 const TOOL_HANDLERS = {
   // ── Utility ──
-  eval_date: (args) => ({ expression: args.expression, resolved: evalDate(args.expression) }),
+  // Accept `expr` as an alias for `expression` — the 2026-05-29 session lost a
+  // round-trip guessing the arg name. The schema's canonical key stays
+  // `expression`; this just keeps a near-miss from silently returning undefined.
+  eval_date: (args) => {
+    const expression = args.expression ?? args.expr;
+    return { expression, resolved: evalDate(expression) };
+  },
 
   calculate: (args) => {
     const result = safeMath(args.expression);
@@ -951,13 +957,31 @@ const TOOL_HANDLERS = {
       return out;
   },
 
-  help: (args, { env }) => {
+  help: async (args, { env, nt }) => {
       const config = {};
+      let notionDbs = null;
       if (env.NOTION_DB_IDS) {
-        try { config.notion_dbs = JSON.parse(env.NOTION_DB_IDS); } catch {}
+        try { notionDbs = JSON.parse(env.NOTION_DB_IDS); config.notion_dbs = notionDbs; } catch {}
       }
       if (env.TODOIST_CONFIG) {
         try { config.todoist = JSON.parse(env.TODOIST_CONFIG); } catch {}
+      }
+      // Resolve each configured DB's title-property NAME (ドメイン / タイトル /
+      // エントリ differ per DB — the 2026-05-29 session lost a round-trip to
+      // this). Best-effort: an entry that isn't a DB (e.g. a page id) or isn't
+      // shared with the integration simply 404s and is omitted. No auto-rewrite
+      // — this only surfaces the real name so callers stop guessing.
+      if (notionDbs && typeof notionDbs === "object") {
+        const titleProps = {};
+        const entries = Object.entries(notionDbs).filter(([, v]) => typeof v === "string");
+        await Promise.all(entries.map(async ([key, id]) => {
+          try {
+            const db = await notionReq(nt, "GET", `/databases/${normalizeId(id)}`);
+            const titleKey = Object.entries(db.properties || {}).find(([, p]) => p.type === "title")?.[0];
+            if (titleKey) titleProps[key] = titleKey;
+          } catch { /* not a DB / not shared — omit */ }
+        }));
+        if (Object.keys(titleProps).length) config.notion_db_title_props = titleProps;
       }
       return {
         tools: TOOLS.map(t => ({ name: t.name, inputSchema: t.inputSchema })),
