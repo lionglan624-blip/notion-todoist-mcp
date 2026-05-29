@@ -2,6 +2,7 @@ import { evalDate, resolveFilterDates, safeMath, sleep, normalizeId, extractNum,
 import {
   notionReq, compactProps, appendBlocksChunked, mdToBlocks,
   resolvePropDates, normalizeProperties, NOTION_CHILDREN_BATCH,
+  mkRichText, RICH_TEXT_BLOCK_TYPES,
 } from "./notion.js";
 import {
   TASK_COMPACT_DEFAULTS, compactTask, buildSectionMap, compactSection,
@@ -12,6 +13,39 @@ import { handleItemCompleted } from "./webhook.js";
 import { TOOLS } from "./tools.js";
 
 const MCP_VERSION = "2024-11-05";
+
+// Levenshtein edit distance — small inputs (property names), so the simple
+// O(m*n) DP is fine. Used to power "did you mean?" hints when a caller passes
+// a property name that isn't in the database schema.
+function editDistance(a, b) {
+  const m = a.length, n = b.length;
+  if (!m) return n;
+  if (!n) return m;
+  let prev = Array.from({ length: n + 1 }, (_, j) => j);
+  let curr = new Array(n + 1);
+  for (let i = 1; i <= m; i++) {
+    curr[0] = i;
+    for (let j = 1; j <= n; j++) {
+      const cost = a[i - 1] === b[j - 1] ? 0 : 1;
+      curr[j] = Math.min(prev[j] + 1, curr[j - 1] + 1, prev[j - 1] + cost);
+    }
+    [prev, curr] = [curr, prev];
+  }
+  return prev[n];
+}
+
+// Nearest known key to `name`, if close enough to be a likely typo. Threshold
+// scales with length so short names need a near-exact match. Returns null when
+// nothing is plausibly close.
+function suggestKey(name, knownKeys) {
+  let best = null, bestD = Infinity;
+  for (const k of knownKeys) {
+    const d = editDistance(name, k);
+    if (d < bestD) { bestD = d; best = k; }
+  }
+  const threshold = Math.max(2, Math.floor(name.length / 3));
+  return best != null && bestD <= threshold ? best : null;
+}
 
 // ─────────────────────────────────────────────
 // Tool handlers — dispatched via TOOL_HANDLERS map below.
@@ -79,6 +113,12 @@ const TOOL_HANDLERS = {
       // 自動ページネーション (fetch_all:true 指定時)
       // 3req/s制限対応: ページ切り替え間に350msウェイト
       const allPages = [];
+      // Real property names seen across the fetched rows — the keys of each
+      // page's `properties` ARE the canonical schema names. Collected so we can
+      // warn when a requested `fields` / `aggregate` name doesn't exist instead
+      // of silently returning null (the n_metrics_series "available options"
+      // courtesy, ported to n_query).
+      const knownKeys = new Set();
       let cursor = args.start_cursor ?? null;
       let remaining = true;
       let fetchCount = 0;
@@ -92,6 +132,7 @@ const TOOL_HANDLERS = {
         fetchCount++;
 
         for (const p of res.results) {
+          for (const k of Object.keys(p.properties)) knownKeys.add(k);
           let props = args.compact !== false ? compactProps(p.properties) : p.properties;
           if (args.fields && args.fields.length) {
             props = Object.fromEntries(args.fields.map(f => [f, props[f] ?? null]));
@@ -118,6 +159,31 @@ const TOOL_HANDLERS = {
         next_cursor: cursor,
         results: pages,
       };
+
+      // Unknown-property warnings. Only meaningful when at least one row came
+      // back (an empty result set tells us nothing about the schema). Covers
+      // `fields` and the property-name args of `aggregate` — both of which fail
+      // silently (null / skipped) rather than erroring like a bad filter does.
+      if (knownKeys.size) {
+        const requested = [];
+        for (const f of args.fields || []) if (typeof f === "string") requested.push(["field", f]);
+        if (args.aggregate) {
+          for (const op of ["sum", "avg", "min", "max", "first", "last", "delta"]) {
+            const p = args.aggregate[op];
+            if (typeof p === "string") requested.push([`aggregate.${op}`, p]);
+          }
+        }
+        const warnings = [];
+        for (const [kind, name] of requested) {
+          if (knownKeys.has(name)) continue;
+          const hint = suggestKey(name, knownKeys);
+          warnings.push(`unknown ${kind}: "${name}"${hint ? ` — did you mean "${hint}"?` : ""}`);
+        }
+        if (warnings.length) {
+          out.warnings = warnings;
+          out.available_fields = [...knownKeys];
+        }
+      }
 
       if (args.aggregate) {
         const agg = args.aggregate;
@@ -288,6 +354,30 @@ const TOOL_HANDLERS = {
       return { id: p.id, url: p.url, archived: p.archived, last_edited_time: p.last_edited_time };
   },
 
+  n_update_block: async (args, { nt }) => {
+      const id = normalizeId(args.block_id);
+      // Delete path.
+      if (args.archived === true || args.delete === true) {
+        const b = await notionReq(nt, "DELETE", `/blocks/${id}`);
+        return { id: b.id, type: b.type, deleted: true };
+      }
+      if (args.content === undefined || args.content === null) {
+        return { error: "Provide `content` to replace the block text, or archived:true / delete:true to remove the block." };
+      }
+      // Replace-text path: a block's type can't change via PATCH, so fetch the
+      // existing type and re-send its rich_text. Non-text block types (image,
+      // divider, table, …) have nothing to replace.
+      const blk = await notionReq(nt, "GET", `/blocks/${id}`);
+      if (!RICH_TEXT_BLOCK_TYPES.has(blk.type)) {
+        return { error: `Block type "${blk.type}" has no editable rich_text. Editable: ${[...RICH_TEXT_BLOCK_TYPES].join(", ")}.` };
+      }
+      const payload = { rich_text: mkRichText(String(args.content)) };
+      // Code blocks require a language; PATCH would otherwise risk clearing it.
+      if (blk.type === "code") payload.language = blk.code?.language || "plain text";
+      const u = await notionReq(nt, "PATCH", `/blocks/${id}`, { [blk.type]: payload });
+      return { id: u.id, type: u.type, last_edited_time: u.last_edited_time };
+  },
+
   n_bulk: async (args, ctx) => {
       // Accept `ops` or `operations` (alias of t_bulk); each item accepts `op` or `action`.
       const raw = args.ops ?? args.operations ?? [];
@@ -296,6 +386,23 @@ const TOOL_HANDLERS = {
   },
 
   n_bulk_metrics: async (args, ctx) => runBulkMetrics(args, ctx),
+
+  quick_log: async (args, ctx) => {
+      if (args.value === undefined || args.value === null) return { error: "value is required" };
+      if (!args.metric || typeof args.metric !== "string") return { error: "metric is required" };
+      const date = args.date || "today";
+      const res = await runBulkMetrics({
+        date,
+        entries: [{ metric: args.metric, value: args.value, unit: args.unit, memo: args.memo }],
+        mode: args.mode || "upsert",
+        database_id: args.database_id,
+      }, ctx);
+      // runBulkMetrics returns {results:[row], ...} or {error}. Flatten the
+      // single row for ergonomics; surface the whole object on error/budget.
+      const row = Array.isArray(res.results) ? res.results[0] : null;
+      if (!row) return res;
+      return { ...row, date: evalDate(date), mode: res.mode };
+  },
 
   n_metrics_series: async (args, ctx) => runMetricsSeries(args, ctx),
 
@@ -829,6 +936,18 @@ const TOOL_HANDLERS = {
       const out = {};
       jobs.forEach(([label], i) => { out[label] = settled[i]; });
       if (!jobs.length) return { error: "No context sources configured. Set CONTEXT_CONFIG, TODOIST_CONFIG.inbox_project_id, or NOTION_DB_IDS.habits_page, or pass args." };
+      // JST-resolved date anchors so callers never hand-compute a date or
+      // round-trip to eval_date for the common cases. Cheap (pure compute).
+      out.dates = {
+        today: evalDate("today"),
+        now: evalDate("now"),
+        yesterday: evalDate("yesterday"),
+        tomorrow: evalDate("tomorrow"),
+        week_start: evalDate("week_start"),
+        week_end: evalDate("week_end"),
+        month_start: evalDate("month_start"),
+        month_end: evalDate("month_end"),
+      };
       return out;
   },
 
@@ -862,6 +981,10 @@ const mdBlockCount = (md) => (md ? mdToBlocks(md).length : 0);
 
 function estimateOpCost(op, budget) {
   if (op.op === "delete") return 1;
+  // update_block: GET (learn type) + PATCH; delete-via-archived is a single DELETE.
+  if (op.op === "update_block") return (op.archived === true || op.delete === true) ? 1 : 2;
+  // insert_after: GET (resolve parent) + one append children call.
+  if (op.op === "insert_after") return 2;
   if (op.op === "create") {
     const overflow = Math.max(0, mdBlockCount(op.content) - NOTION_CHILDREN_BATCH);
     return 1 + Math.ceil(overflow / NOTION_CHILDREN_BATCH);
@@ -912,6 +1035,43 @@ async function execNotionOp(op, idx, nt, budget, spentBefore) {
         const pid = normalizeId(op.page_id);
         const p = await notionReq(nt, "PATCH", `/pages/${pid}`, { archived: true });
         return { index: idx, op: "delete", ok: true, id: p.id, url: p.url, __cost: 1 };
+      }
+      case "update_block": {
+        if (!op.block_id) throw new Error("block_id required for update_block");
+        const bid = normalizeId(op.block_id);
+        if (op.archived === true || op.delete === true) {
+          const b = await notionReq(nt, "DELETE", `/blocks/${bid}`);
+          return { index: idx, op: "update_block", ok: true, id: b.id, deleted: true, __cost: 1 };
+        }
+        if (op.content === undefined || op.content === null) {
+          throw new Error("update_block needs content (replacement text) or archived/delete:true");
+        }
+        const blk = await notionReq(nt, "GET", `/blocks/${bid}`);
+        if (!RICH_TEXT_BLOCK_TYPES.has(blk.type)) {
+          throw new Error(`Block type "${blk.type}" has no editable rich_text`);
+        }
+        const payload = { rich_text: mkRichText(String(op.content)) };
+        if (blk.type === "code") payload.language = blk.code?.language || "plain text";
+        const u = await notionReq(nt, "PATCH", `/blocks/${bid}`, { [blk.type]: payload });
+        return { index: idx, op: "update_block", ok: true, id: u.id, __cost: 2 };
+      }
+      case "insert_after": {
+        if (!op.block_id) throw new Error("block_id required for insert_after");
+        const bid = normalizeId(op.block_id);
+        const blocks = mdToBlocks(op.content || "");
+        if (!blocks.length) throw new Error("insert_after needs non-empty content");
+        if (blocks.length > NOTION_CHILDREN_BATCH) {
+          throw new Error(`insert_after is capped at ${NOTION_CHILDREN_BATCH} blocks; got ${blocks.length}. Split the insert.`);
+        }
+        // Notion inserts via the PARENT's children endpoint with `after:<sibling>`.
+        const blk = await notionReq(nt, "GET", `/blocks/${bid}`);
+        const parent = blk.parent || {};
+        const parentRaw = parent.type === "page_id" ? parent.page_id
+          : parent.type === "block_id" ? parent.block_id : null;
+        if (!parentRaw) throw new Error("could not resolve the parent of block_id for insertion");
+        const r = await notionReq(nt, "PATCH", `/blocks/${normalizeId(parentRaw)}/children`, { children: blocks, after: bid });
+        const ids = (r.results || []).map(b => b.id);
+        return { index: idx, op: "insert_after", ok: true, inserted: ids.length, ids, __cost: 2 };
       }
       case "update": {
         if (!op.page_id) throw new Error("page_id required for update");

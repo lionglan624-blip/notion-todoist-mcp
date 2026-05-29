@@ -2,7 +2,7 @@
 
 A custom [MCP (Model Context Protocol)](https://modelcontextprotocol.io/) server running on Cloudflare Workers that provides Claude with full read/write access to Notion and Todoist. Protected by OAuth 2.1 for use with remote MCP clients.
 
-## Features (36 tools)
+## Features (38 tools)
 
 ### Todoist (18 tools)
 
@@ -23,17 +23,19 @@ A custom [MCP (Model Context Protocol)](https://modelcontextprotocol.io/) server
 | `t_create_section` / `t_update_section` / `t_delete_section` | Manage sections |
 | `t_get_labels` | List all personal labels |
 
-### Notion (13 tools)
+### Notion (15 tools)
 
 | Tool | Description |
 |------|-------------|
-| `n_query` | Query a database with filters, sorts, auto-pagination, and aggregations (sum/avg/min/max/delta) |
+| `n_query` | Query a database with filters, sorts, auto-pagination, and aggregations (sum/avg/min/max/delta). Unknown `fields`/`aggregate` property names surface a `warnings` + `available_fields` hint (with "did you mean?") instead of silently returning null |
 | `n_create_page` | Create a page with property shorthand and Markdown body |
 | `n_update_page` | Update properties, replace or append page body content (`archived:true` trashes the page) |
 | `n_delete_page` | Delete a page by archiving it (convenience wrapper; `restore:true` un-archives) |
-| `n_bulk` | Execute many create/update/delete ops in one call (`ops` or `operations`; each item accepts `op` or `action`). Per-op results (partial failures don't abort); subrequest-budget aware with `start_cursor` continuation. Prefer over looping single calls for batch writes |
+| `n_update_block` | Edit one block in place — `content` replaces its text (block type & `page_id` preserved), `archived:true`/`delete:true` removes it. Uses a `block_id` from `n_get_blocks`. Budget-safe partial edits of large pages without `replace_content`'s delete-storm |
+| `n_bulk` | Execute many create/update/delete ops in one call (`ops` or `operations`; each item accepts `op` or `action`). Also supports block-level ops: `update_block` {block_id, content?/archived?} and `insert_after` {block_id, content}. Per-op results (partial failures don't abort); subrequest-budget aware with `start_cursor` continuation. Prefer over looping single calls for batch writes |
 | `n_bulk_metrics` | Sugar over `n_bulk` for the Metrics DB: log many same-date metrics at once (`{date, entries:[{metric, value, unit?, memo?}], mode?}`). Maps to Notion properties 指標/値/単位/メモ. `mode: "create"` (default) / `"upsert"` / `"skip_existing"` — use the latter two for backfills to avoid duplicates. `metric` names normalized via `METRIC_ALIASES` env var |
 | `n_metrics_series` | Trend-read sugar over the Metrics DB: one call returns `{series:[{date,値,…}], stats:{first,last,delta,min,max,avg,median,count}}` for a single `metric` with optional `from`/`to` date bounds. Always sorted ascending; `limit:N` keeps the oldest N, `tail:N` keeps the latest N (use `tail` for "most recent N for trend display"). When `METRIC_RANGES` env var defines a reference range for the metric, also returns `ref:{low,high}` + `last_flag:"high"/"low"/"normal"` against the final entry. Replaces the n_query→filter→sorts→stats boilerplate |
+| `quick_log` | One-shot single-metric log into the Metrics DB (`{metric, value, unit?, memo?, date?, mode?}`). Sugar over `n_bulk_metrics` for a single reading; defaults `date:"today"` + `mode:"upsert"` (idempotent re-logging). For daily one-liners (resting HR, weight, RPE) |
 | `n_get_page` | Get a single page with all properties |
 | `n_get_blocks` | Get page body as plain text with heading markers (`##`/`###`/`####`) |
 | `n_get_schema` | Get database property schema |
@@ -45,10 +47,10 @@ A custom [MCP (Model Context Protocol)](https://modelcontextprotocol.io/) server
 
 | Tool | Description |
 |------|-------------|
-| `eval_date` | Resolve JST date expressions (`today`, `today+7d`, `yesterday`, `today-2w`, `now`, etc.) |
+| `eval_date` | Resolve JST date expressions (`today`, `today+7d`, `yesterday`, `today-2w`, `now`, `week_start`/`week_end` for this week's Mon–Sun, `month_start`/`month_end`, etc.) |
 | `calculate` | Safe math evaluator with `Math.*` support (no `eval`) |
 | `stats` | Compute statistics (count, sum, avg, min, max, median, delta) from a number array |
-| `context` | Single-call conversation bootstrap. Fetches configured sources in parallel. Resolution: per-call args > `CONTEXT_CONFIG` env var > legacy defaults (`TODOIST_CONFIG.inbox_project_id` + `NOTION_DB_IDS.habits_page`). Supports `tasks`, `pages`, `extra_pages`, `queries` slots |
+| `context` | Single-call conversation bootstrap. Fetches configured sources in parallel and always returns a `dates` block of JST-resolved anchors (today/now/week_start/week_end/month_start/month_end). Resolution: per-call args > `CONTEXT_CONFIG` env var > legacy defaults (`TODOIST_CONFIG.inbox_project_id` + `NOTION_DB_IDS.habits_page`). Supports `tasks`, `pages`, `extra_pages`, `queries` slots |
 | `help` | Return the full tool list (names + inputSchemas) plus static workspace config (pre-configured database/project IDs) |
 
 ## Key Design Choices

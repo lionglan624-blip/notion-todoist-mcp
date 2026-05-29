@@ -35,6 +35,24 @@ export function evalDate(expr) {
     return isoDate(d);
   }
 
+  // Week / month anchors (JST). Week starts Monday (ISO 8601). These let
+  // callers express "this week's Monday" without hand-computing a date, and
+  // work anywhere evalDate is applied (filters, due dates, the context bundle).
+  // mondayOffset = days elapsed since the most recent Monday (0 when today IS Monday).
+  const mondayOffset = (todayJST.getUTCDay() + 6) % 7;
+  if (expr === "week_start" || expr === "monday" || expr === "this_monday") {
+    const d = new Date(todayJST); d.setUTCDate(d.getUTCDate() - mondayOffset); return isoDate(d);
+  }
+  if (expr === "week_end" || expr === "sunday" || expr === "this_sunday") {
+    const d = new Date(todayJST); d.setUTCDate(d.getUTCDate() - mondayOffset + 6); return isoDate(d);
+  }
+  if (expr === "month_start") {
+    return isoDate(new Date(Date.UTC(todayJST.getUTCFullYear(), todayJST.getUTCMonth(), 1)));
+  }
+  if (expr === "month_end") {
+    return isoDate(new Date(Date.UTC(todayJST.getUTCFullYear(), todayJST.getUTCMonth() + 1, 0)));
+  }
+
   return expr; // ISO date/datetime pass-through
 }
 

@@ -243,6 +243,25 @@ export const TOOLS = [
   },
 
   {
+    name: "n_update_block",
+    description:
+      "Edit a single Notion block in place — the budget-safe way to fix one line of a large page without touching the rest. " +
+      "Pass content to replace the block's text (inline Markdown: **bold**, *italic*, `code`); the block keeps its existing type (paragraph/heading/list item/quote/callout/toggle/code) and the page_id is preserved. " +
+      "Pass archived:true (or delete:true) to remove the block instead. " +
+      "block_id comes straight from n_get_blocks. To insert new blocks rather than edit one, use n_bulk op:\"insert_after\".",
+    inputSchema: {
+      type: "object",
+      properties: {
+        block_id: { type: "string", description: "Block ID (from n_get_blocks)" },
+        content: { type: "string", description: "Replacement text (inline Markdown). Preserves the block's type." },
+        archived: { type: "boolean", description: "true = delete the block" },
+        delete: { type: "boolean", description: "Alias of archived:true" },
+      },
+      required: ["block_id"],
+    },
+  },
+
+  {
     name: "n_bulk",
     description:
       "Execute multiple Notion operations in one call. " +
@@ -250,6 +269,8 @@ export const TOOLS = [
       "op:\"create\" {database_id, properties, content?} — same semantics as n_create_page (property shorthand + Markdown body). " +
       "op:\"update\" {page_id, properties?, append_content?, replace_content?, archived?} — same as n_update_page. " +
       "op:\"delete\" {page_id} — archives the page. " +
+      "op:\"update_block\" {block_id, content?, archived?} — replace one block's text in place (preserves block type & page_id), or archived:true to delete it. Use block_id from n_get_blocks for budget-safe partial edits of large pages. " +
+      "op:\"insert_after\" {block_id, content} — insert Markdown block(s) immediately after the given block within its parent (≤100 blocks). " +
       "Returns per-op results [{index, op, ok, id?, url?, error?}]; one failure does NOT abort the rest. " +
       "Subrequest-budget aware: processes ops until the per-Worker-invocation budget (SUBREQUEST_BUDGET env var, default 50 = Cloudflare free tier) would be exceeded, then returns remaining + next_cursor. " +
       "Re-call with start_cursor:<next_cursor> to continue — loop until remaining is absent. " +
@@ -263,15 +284,16 @@ export const TOOLS = [
           items: {
             type: "object",
             properties: {
-              op: { type: "string", enum: ["create", "update", "delete"], description: "Alias: `action`" },
-              action: { type: "string", enum: ["create", "update", "delete"], description: "Alias of `op` for t_bulk parity" },
+              op: { type: "string", enum: ["create", "update", "delete", "update_block", "insert_after"], description: "Alias: `action`" },
+              action: { type: "string", enum: ["create", "update", "delete", "update_block", "insert_after"], description: "Alias of `op` for t_bulk parity" },
               database_id: { type: "string", description: "Required for create" },
               page_id: { type: "string", description: "Required for update/delete" },
+              block_id: { type: "string", description: "Required for update_block/insert_after (from n_get_blocks)" },
               properties: { type: "object", description: "Property shorthand (create/update)" },
-              content: { type: "string", description: "Markdown body (create)" },
+              content: { type: "string", description: "Markdown body (create); replacement text (update_block); inserted Markdown (insert_after)" },
               append_content: { type: "string", description: "Markdown appended after existing blocks (update)" },
               replace_content: { type: "string", description: "Markdown replacing the whole body (update) — prefer delete+create" },
-              archived: { type: "boolean", description: "true trashes the page (update)" },
+              archived: { type: "boolean", description: "true trashes the page (update) or deletes the block (update_block)" },
             },
           },
         },
@@ -359,10 +381,32 @@ export const TOOLS = [
     },
   },
 
+  {
+    name: "quick_log",
+    description:
+      "One-shot single-metric log into the 📊 Metrics DB. quick_log({metric, value, unit?, memo?, date?, mode?}). " +
+      "Lightweight sugar over n_bulk_metrics for a single reading — defaults date:\"today\" and mode:\"upsert\" so re-logging the same metric on the same date updates in place instead of duplicating. " +
+      "Use for daily one-liners (resting HR, weight, RPE). For several metrics at once use n_bulk_metrics. " +
+      "Returns the single per-entry result ({status, id, url, title, date}). metric normalized via METRIC_ALIASES.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        metric: { type: "string", description: "Metric name (the 指標 select value); normalized via METRIC_ALIASES" },
+        value: { type: "number", description: "Numeric value (becomes 値)" },
+        unit: { type: "string", description: "Optional unit (becomes 単位)" },
+        memo: { type: "string", description: "Optional note (becomes メモ)" },
+        date: { type: "string", description: "Date expression or ISO date. Default: today" },
+        mode: { type: "string", enum: ["create", "upsert", "skip_existing"], description: "Collision behavior. Default: upsert (idempotent)." },
+        database_id: { type: "string", description: "Override the Metrics DB id (default: NOTION_DB_IDS.metrics)" },
+      },
+      required: ["metric", "value"],
+    },
+  },
+
   // ── Utility ───────────────────────────────
   {
     name: "eval_date",
-    description: "Resolve a JST date expression to ISO date. Supports: today, yesterday, tomorrow, today+7d, today-30d, today+2w, today+1m, now.",
+    description: "Resolve a JST date expression to ISO date. Supports: today, yesterday, tomorrow, today+7d, today-30d, today+2w, today+1m, today+1y, now, week_start/week_end (Mon–Sun of this week), month_start/month_end.",
     inputSchema: {
       type: "object",
       properties: { expression: { type: "string" } },
@@ -608,6 +652,7 @@ export const TOOLS = [
     name: "context",
     description:
       "Single-call conversation bootstrap. Fetches configured context sources in parallel. " +
+      "Always includes a `dates` block of JST-resolved anchors (today, now, yesterday, tomorrow, week_start/week_end, month_start/month_end) so callers never hand-compute dates or round-trip to eval_date. " +
       "Resolution order per slot: per-call args > CONTEXT_CONFIG env var > legacy defaults " +
       "(TODOIST_CONFIG.inbox_project_id + NOTION_DB_IDS.habits_page). " +
       "Call this once at the start of every conversation. " +

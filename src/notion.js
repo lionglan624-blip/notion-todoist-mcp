@@ -102,7 +102,18 @@ function splitLongRichText(parts) {
   return out;
 }
 
-function mkRichText(line) {
+// Block types that carry an editable `rich_text` array. Used by the
+// block-level update path (n_update_block / n_bulk update_block) to reject
+// types like image/divider/table whose text can't be PATCHed in place.
+// (A block's *type* can't be changed via PATCH — only its rich_text — so the
+// caller is replacing text within the existing block type.)
+export const RICH_TEXT_BLOCK_TYPES = new Set([
+  "paragraph", "heading_1", "heading_2", "heading_3",
+  "bulleted_list_item", "numbered_list_item", "to_do",
+  "quote", "callout", "toggle", "code",
+]);
+
+export function mkRichText(line) {
   const parts = [];
   // tokenize inline: **bold**, *italic*, `code`
   const re = /(\*\*(.+?)\*\*|\*(.+?)\*|`([^`]+)`)/g;
