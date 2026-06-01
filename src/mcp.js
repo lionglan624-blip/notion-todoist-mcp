@@ -1094,8 +1094,22 @@ async function execNotionOp(op, idx, nt, budget, spentBefore) {
           : parent.type === "block_id" ? parent.block_id : null;
         if (!parentRaw) throw new Error("could not resolve the parent of block_id for insertion");
         const r = await notionReq(nt, "PATCH", `/blocks/${normalizeId(parentRaw)}/children`, { children: blocks, after: bid });
-        const ids = (r.results || []).map(b => b.id);
-        return { index: idx, op: "insert_after", ok: true, inserted: ids.length, ids, __cost: 2 };
+        // Notion's append-with-`after` returns, in document order, the newly
+        // created blocks FOLLOWED by the existing siblings it shifted down. We
+        // sent `blocks.length` new blocks, so the first N ids are the inserts
+        // and the rest (if any) are pre-existing siblings that merely moved.
+        // Splitting them keeps the result honest — `inserted`/`ids` now reflect
+        // only what this op actually added (the old shape leaked sibling ids
+        // into `inserted`, e.g. inserted:28 for a 1-block insert).
+        const allIds = (r.results || []).map(b => b.id);
+        const ids = allIds.slice(0, blocks.length);
+        const shifted = allIds.slice(blocks.length);
+        return {
+          index: idx, op: "insert_after", ok: true,
+          inserted: ids.length, ids,
+          ...(shifted.length && { shifted_siblings: shifted }),
+          __cost: 2,
+        };
       }
       case "update": {
         if (!op.page_id) throw new Error("page_id required for update");
@@ -1298,7 +1312,11 @@ async function runBulkMetrics(args, { env, nt }) {
   if (!metricsIdRaw) return { error: "Metrics DB id not configured (NOTION_DB_IDS.metrics)" };
   const metricsId = normalizeId(metricsIdRaw);
 
-  const mode = args.mode || "create";
+  // Default flipped create→upsert (2026-06-01): idempotent on (date, metric) so
+  // re-runs/backfills don't duplicate — the dominant footgun behind the
+  // 2026-05-28 34-row incident. Pass mode:"create" explicitly only when you
+  // genuinely want a fresh row regardless of collisions.
+  const mode = args.mode || "upsert";
   if (!["create", "upsert", "skip_existing"].includes(mode)) {
     return { error: `Invalid mode: ${mode}. Use create | upsert | skip_existing.` };
   }

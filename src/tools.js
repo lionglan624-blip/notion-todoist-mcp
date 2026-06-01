@@ -270,7 +270,7 @@ export const TOOLS = [
       "op:\"update\" {page_id, properties?, append_content?, replace_content?, archived?} — same as n_update_page. " +
       "op:\"delete\" {page_id} — archives the page. " +
       "op:\"update_block\" {block_id, content?, archived?} — replace one block's text in place (preserves block type & page_id), or archived:true to delete it. Use block_id from n_get_blocks for budget-safe partial edits of large pages. " +
-      "op:\"insert_after\" {block_id, content} — insert Markdown block(s) immediately after the given block within its parent (≤100 blocks). " +
+      "op:\"insert_after\" {block_id, content} — insert Markdown block(s) immediately after the given block within its parent (≤100 blocks). Returns `ids` = ONLY the newly-inserted block ids; any existing siblings Notion shifted down come back separately as `shifted_siblings` (so `inserted` reflects what was actually added). " +
       "Returns per-op results [{index, op, ok, id?, url?, error?}]; one failure does NOT abort the rest. " +
       "Subrequest-budget aware: processes ops until the per-Worker-invocation budget (SUBREQUEST_BUDGET env var, default 50 = Cloudflare free tier) would be exceeded, then returns remaining + next_cursor. " +
       "Re-call with start_cursor:<next_cursor> to continue — loop until remaining is absent. " +
@@ -312,11 +312,10 @@ export const TOOLS = [
       "Each entry writes a Metrics row with: エントリ title = `YYYY-MM-DD_<metric>`, 指標 select = <metric> (auto-created if new), 値 number = <value>, 日付 date = <date>, optional 単位/メモ rich_text = <unit>/<memo>. " +
       "(Schema uses ASCII keys because the Anthropic tool-use API requires them; the Notion property names themselves stay Japanese. Japanese input keys 指標/値/単位/メモ are also accepted as a fallback.) " +
       "date accepts a date expression (today, today-7d, …) or ISO date. " +
-      "mode (default \"create\" for backward compat): " +
-      "\"create\" = always insert (may duplicate on re-runs); " +
+      "mode (default \"upsert\" — idempotent on the same date+metric, safe for re-runs/backfills): " +
       "\"upsert\" = update if a row with the same エントリ title already exists, else create; " +
-      "\"skip_existing\" = leave the existing row untouched, return status:\"skipped\". " +
-      "**Use \"skip_existing\" or \"upsert\" for backfills / re-runs** — \"create\" mode is duplicate-prone. " +
+      "\"skip_existing\" = leave the existing row untouched, return status:\"skipped\"; " +
+      "\"create\" = always insert a fresh row (may duplicate on re-runs) — opt into this only when you genuinely want a duplicate. " +
       "Returns per-entry status: \"created\" | \"updated\" | \"skipped\" | \"error\". " +
       "metric names are normalized via the optional METRIC_ALIASES env var (JSON map, e.g. {\"γGT\":\"γGTP\",\"Cr\":\"クレアチニン\"}) so synonyms don't fork the select. " +
       "Same subrequest-budget chunking + start_cursor continuation as n_bulk. " +
@@ -341,7 +340,7 @@ export const TOOLS = [
         mode: {
           type: "string",
           enum: ["create", "upsert", "skip_existing"],
-          description: "Collision behavior when the エントリ title already exists. Default \"create\" (backward-compat). Use \"skip_existing\" or \"upsert\" for backfills.",
+          description: "Collision behavior when the エントリ title already exists. Default \"upsert\" (idempotent). Pass \"create\" only to force a duplicate row.",
         },
         database_id: { type: "string", description: "Override the Metrics DB id (default: NOTION_DB_IDS.metrics)" },
         start_cursor: { type: "number", description: "Resume from this entry index" },

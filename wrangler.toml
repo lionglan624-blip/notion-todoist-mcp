@@ -19,7 +19,18 @@ TODOIST_CONFIG = '{"inbox_project_id":"6g8v9q87rGcggMM6"}'
 # and n_metrics_series (read). Extend when new synonyms are observed; remove
 # only if the legacy DB rows have been retitled. The 腹囲 / 下腹囲 pair is
 # intentionally NOT aliased — they are physically different measurements.
-METRIC_ALIASES = '{"γGT":"γGTP","Cr":"クレアチニン"}'
+#
+# 睡眠→睦眠 (typo-defense): the canonical select options were created with a
+# typo (睦眠 instead of 睡眠) and hold all the existing sleep data. These
+# aliases route the *correct* spelling onto the existing (typo) options so
+# writing 睡眠 no longer forks a duplicate select. Canonical stays the typo
+# until the option is renamed in Notion (rows auto-migrate on rename); flip
+# the alias direction to 睦眠→睡眠 if/when that happens.
+#
+# HR/安静時心拍数/心拍 → RHR consolidates resting-heart-rate synonyms onto the
+# RHR option. 脈拍 is intentionally NOT aliased — it's a distinct point-in-time
+# pulse measurement, not a resting-HR average (cf. 腹囲 / 下腹囲).
+METRIC_ALIASES = '{"γGT":"γGTP","Cr":"クレアチニン","平均睡眠時間":"平均睦眠時間","レム睡眠平均":"レム睦眠平均","コア睡眠平均":"コア睦眠平均","深い睡眠平均":"深い睦眠平均","HR":"RHR","安静時心拍数":"RHR","心拍":"RHR"}'
 
 # 指標 reference ranges: { "<canonical_name>": [low, high], ... }. Either
 # bound may be null for one-sided ranges (e.g. LDL has only an upper bound).
@@ -31,7 +42,10 @@ METRIC_ALIASES = '{"γGT":"γGTP","Cr":"クレアチニン"}'
 # printed reference values (JSH 2019 for BP, JSC for lipids, JDS for HbA1c,
 # JSN for eGFR, etc.). Adjust to match the printed range on YOUR lab report
 # or your personal targets — these are general adult-male defaults.
-METRIC_RANGES = '{"LDL":[null,119],"HDL":[40,null],"中性脂肪":[null,149],"総コレステロール":[140,199],"HbA1c":[null,5.5],"血糖":[70,99],"ALT":[null,30],"AST":[null,30],"γGTP":[null,50],"クレアチニン":[0.65,1.07],"eGFR":[60,null],"尿酸":[3.7,7.0],"収縮期血圧":[null,129],"拡張期血圧":[null,79],"BMI":[18.5,24.9],"腹囲":[null,84],"Hb":[13.5,17.0],"体脂肪率":[11,21]}'
+# RHR [50,75]: fitness-oriented resting-heart-rate target (not the clinical
+# 60–100 tachy/brady cutoff) so the flag actually fires — >75 monthly avg = high,
+# <50 = low. Adjust to your own baseline.
+METRIC_RANGES = '{"LDL":[null,119],"HDL":[40,null],"中性脂肪":[null,149],"総コレステロール":[140,199],"HbA1c":[null,5.5],"血糖":[70,99],"ALT":[null,30],"AST":[null,30],"γGTP":[null,50],"クレアチニン":[0.65,1.07],"eGFR":[60,null],"尿酸":[3.7,7.0],"収縮期血圧":[null,129],"拡張期血圧":[null,79],"BMI":[18.5,24.9],"腹囲":[null,84],"Hb":[13.5,17.0],"体脂肪率":[11,21],"RHR":[50,75]}'
 
 # OAuth state: authorization-code single-use + refresh-token rotation.
 # Keys: code:<jti> (TTL 5min), rt:<jti> (TTL 30d), fam:<fam> (TTL 30d, reuse poison).

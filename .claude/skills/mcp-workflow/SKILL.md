@@ -224,7 +224,7 @@ logging reason + `最終更新日`.
 
 | Trigger | State | Metrics | Events | Food Master |
 |---------|-------|---------|--------|-------------|
-| Habit/plan change | ✅ overwrite | — | ✅ append (種別: 習慣変更/食事変更/サプリ変更) | — |
+| Habit/plan change | ✅ overwrite | — | ✅ append (`カテゴリ`: 習慣変更/食事変更/サプリ変更) | — |
 | Numeric measurement (weight, BP, etc.) | — | ✅ append | — | — |
 | Non-numeric event (visit, surgery, purchase) | — | — | ✅ append | — |
 | New food/supplement registration | — | — | — | ✅ create/update |
@@ -233,15 +233,34 @@ logging reason + `最終更新日`.
 **Habit/plan changes MUST update both State AND Events. Never one without the
 other.**
 
+> **Events category is `カテゴリ` (multi_select), not `種別`.** Live options:
+> 食事変更 / 運動 / 怪我 / 病気 / サプリ変更 / 体組成 / プラン変更 / メモ / 受診 / 習慣変更.
+> Confirm with `n_get_schema` before guessing — the property name drifted from
+> earlier docs.
+
 ### Food Master Rules
 
 - Food Master stores only nutrients and per-serving unit data.
 - Intake timing, frequency, daily totals → State habits page (not Food Master).
+- **The `現行` checkbox is NOT a reliable signal of what's actually being
+  consumed.** It drifts (e.g. カゼイン/シトルリン/クレアチン stayed `現行:true`
+  for weeks after intake stopped). The source of truth for *actual current
+  intake* is the **State 食事プラン**, not this flag. Treat Food Master as a
+  nutrient master; when you need "am I taking X right now?", read State and, if
+  it conflicts with `現行`, trust State. Set `終了日` + clear `現行` only as a
+  bookkeeping courtesy, never as the authority.
 
 ### State DB Rules
 
 - One row per domain, overwrite (history goes to Events).
 - "What is my current …?" → read State directly.
+- **Pick ONE source of truth per domain: the `内容` property OR the body
+  blocks — not both.** Current-status summaries (筋トレ状況・フェーズ等) have been
+  duplicated across `内容` and the page body, forcing dual updates and inviting
+  drift. Recommendation: keep the body blocks as the canonical narrative
+  (now safely partial-editable via `n_update_block`) and let `内容` be a short
+  manual one-liner — or drop `内容` — but never maintain the same fact in both.
+  When updating one, don't silently leave the other stale.
 
 ### Metrics Rules
 
