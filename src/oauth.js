@@ -214,6 +214,9 @@ function escapeHtml(s) {
 export async function handleAuthorize(request, url, env) {
   if (request.method === "GET") {
     const p = Object.fromEntries(url.searchParams);
+    if (p.response_type !== "code") {
+      return new Response("invalid_request: response_type must be code", { status: 400 });
+    }
     if (!p.redirect_uri || !p.code_challenge || p.code_challenge_method !== "S256") {
       return new Response("invalid_request: redirect_uri and PKCE S256 required", { status: 400 });
     }

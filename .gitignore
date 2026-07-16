@@ -4,3 +4,5 @@ node_modules/
 build.bat
 push.bat
 CLAUDE.md
+.dev.vars
+.tmp_*

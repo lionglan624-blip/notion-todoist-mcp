@@ -56,12 +56,19 @@ export async function handleItemCompleted(event, token) {
   const parentId = data.parent_id ?? null;
   if (parentId) assertTodoistId(parentId, "parent_id");
 
-  const raw = await todoistReq(
-    token,
-    "GET",
-    `/tasks?section_id=${encodeURIComponent(sectionId)}`,
-  );
-  const items = Array.isArray(raw) ? raw : (raw?.results ?? []);
+  // Cursor-paginate the section fetch (20-page safety cap, mirroring the
+  // cron's listAllTasks). A single unpaginated GET only sees the first API
+  // page — renumbering off a partial sibling list could assign duplicate #N.
+  const items = [];
+  let cursor = "";
+  for (let page = 0; page < 20; page++) {
+    const qs = `/tasks?section_id=${encodeURIComponent(sectionId)}` +
+      (cursor ? `&cursor=${encodeURIComponent(cursor)}` : "");
+    const raw = await todoistReq(token, "GET", qs);
+    items.push(...(Array.isArray(raw) ? raw : (raw?.results ?? [])));
+    cursor = raw?.next_cursor ?? "";
+    if (!cursor) break;
+  }
 
   const seq = [];
   for (const t of items) {

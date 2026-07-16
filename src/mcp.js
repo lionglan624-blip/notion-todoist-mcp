@@ -125,6 +125,10 @@ const TOOL_HANDLERS = {
       // of silently returning null (the n_metrics_series "available options"
       // courtesy, ported to n_query).
       const knownKeys = new Set();
+      // Aggregations must read the FULL property set — `fields` only restricts
+      // the returned rows. Without this, aggregate:{avg:"値"} + fields:["日付"]
+      // silently aggregated over nothing.
+      const aggRows = args.aggregate ? [] : null;
       let cursor = args.start_cursor ?? null;
       let remaining = true;
       let fetchCount = 0;
@@ -140,6 +144,7 @@ const TOOL_HANDLERS = {
         for (const p of res.results) {
           for (const k of Object.keys(p.properties)) knownKeys.add(k);
           let props = args.compact !== false ? compactProps(p.properties) : p.properties;
+          if (aggRows) aggRows.push(props);
           if (args.fields && args.fields.length) {
             props = Object.fromEntries(args.fields.map(f => [f, props[f] ?? null]));
           }
@@ -198,9 +203,11 @@ const TOOL_HANDLERS = {
         for (const op of ["sum", "avg", "min", "max", "first", "last", "delta"]) {
           const prop = agg[op];
           if (!prop) continue;
-          // compactProps already reduces to scalar; handle both scalar and Notion property object
-          const nums = pages.map(p => {
-            const v = p.properties[prop];
+          // compactProps already reduces to scalar; handle both scalar and Notion property object.
+          // Read from aggRows (pre-`fields` filtering) so restricting output
+          // fields doesn't starve the aggregation.
+          const nums = aggRows.map(props => {
+            const v = props[prop];
             return typeof v === "number" ? v : extractNum(v);
           }).filter(n => typeof n === "number" && !isNaN(n));
           if (!nums.length) continue;
@@ -229,7 +236,11 @@ const TOOL_HANDLERS = {
   n_get_blocks: async (args, { nt }) => {
       const id = normalizeId(args.page_id);
       const pageSize = args.page_size ?? 100;
-      const res = await notionReq(nt, "GET", `/blocks/${id}/children?page_size=${pageSize}`);
+      // start_cursor lets callers walk pages >100 blocks — without it the
+      // returned next_cursor was a dead end.
+      const params = new URLSearchParams({ page_size: String(pageSize) });
+      if (args.start_cursor) params.set("start_cursor", String(args.start_cursor));
+      const res = await notionReq(nt, "GET", `/blocks/${id}/children?${params}`);
       const extractText = (richTexts) => (richTexts || []).map(t => t.plain_text).join("");
       const blocks = res.results.map(b => {
         const type = b.type;
@@ -296,15 +307,23 @@ const TOOL_HANDLERS = {
       return { id: p.id, url: p.url, created_time: p.created_time };
   },
 
-  n_update_page: async (args, { nt }) => {
+  n_update_page: async (args, { env, nt }) => {
       const pid = normalizeId(args.page_id);
       let replaceWarnings = null;
+      let staleBlocks = 0;
+      // Subrequest budget tracking — same limit runNotionBulk respects. The
+      // standalone path previously deleted blocks unbounded, so a large page's
+      // replace_content could blow the per-invocation cap mid-delete and die
+      // with "Too many subrequests" instead of returning a warning.
+      const budget = Math.max(1, Number(env.SUBREQUEST_BUDGET) || 50);
+      let spent = 0;
       // 1. Property / archived update
       if (args.properties || args.archived !== undefined) {
         const body = {};
         if (args.properties) body.properties = resolvePropDates(normalizeProperties(args.properties));
         if (args.archived !== undefined) body.archived = args.archived;
         await notionReq(nt, "PATCH", `/pages/${pid}`, body);
+        spent += 1;
       }
       // 2. replace_content: append new blocks FIRST, then delete old ones.
       // Order matters: if we deleted first and the append failed, the page
@@ -317,6 +336,7 @@ const TOOL_HANDLERS = {
         do {
           const qs = cursor ? `?page_size=100&start_cursor=${cursor}` : `?page_size=100`;
           const page = await notionReq(nt, "GET", `/blocks/${pid}/children${qs}`);
+          spent += 1;
           oldBlocks.push(...page.results);
           cursor = page.has_more ? page.next_cursor : null;
         } while (cursor);
@@ -324,13 +344,17 @@ const TOOL_HANDLERS = {
         const newBlocks = mdToBlocks(args.replace_content);
         if (newBlocks.length) {
           await appendBlocksChunked(nt, pid, newBlocks);
+          spent += Math.ceil(newBlocks.length / NOTION_CHILDREN_BATCH);
         }
         // Only delete old blocks after new content is safely in place.
         // Track deletion failures so the caller knows the page has stale blocks.
+        // Keep 3 subrequests of headroom (possible append_content + final GET).
         const deleteFailures = [];
         for (const blk of oldBlocks) {
+          if (spent >= budget - 3) { staleBlocks++; continue; }
           try {
             await notionReq(nt, "DELETE", `/blocks/${blk.id}`);
+            spent += 1;
           } catch (e) {
             deleteFailures.push({ id: blk.id, error: e.message });
           }
@@ -350,6 +374,11 @@ const TOOL_HANDLERS = {
       const p = await notionReq(nt, "GET", `/pages/${pid}`);
       const out = { id: p.id, url: p.url, last_edited_time: p.last_edited_time };
       if (replaceWarnings) out.replace_warnings = replaceWarnings;
+      if (staleBlocks > 0) {
+        out.stale_blocks = staleBlocks;
+        out.warning = `${staleBlocks} old block(s) left undeleted (subrequest budget ${budget} reached). ` +
+          `Re-run replace_content (or delete the page and recreate) to finish cleanup.`;
+      }
       return out;
   },
 
@@ -624,9 +653,19 @@ const TOOL_HANDLERS = {
       if (args.filter)     params.set("filter", args.filter);
       if (args.ids?.length) params.set("ids", args.ids.join(","));
       if (args.limit)      params.set("limit", String(args.limit));
-      const qs = params.toString();
-      const raw = await todoistReq(tt, "GET", `/tasks${qs ? "?" + qs : ""}`);
-      const items = Array.isArray(raw) ? raw : (raw?.results ?? []);
+      // No explicit limit → auto-paginate with the cursor (20-page safety cap,
+      // same as the cron). A single GET only returns the first API page, which
+      // silently truncated large projects/queries.
+      const items = [];
+      let cursor = null;
+      for (let page = 0; page < 20; page++) {
+        if (cursor) params.set("cursor", cursor);
+        const qs = params.toString();
+        const raw = await todoistReq(tt, "GET", `/tasks${qs ? "?" + qs : ""}`);
+        items.push(...(Array.isArray(raw) ? raw : (raw?.results ?? [])));
+        cursor = raw?.next_cursor ?? null;
+        if (!cursor || args.limit) break;
+      }
       return formatTodoistList(items, (t) => compactTask(t, args.fields, sectionMap), args);
   },
 
@@ -656,10 +695,13 @@ const TOOL_HANDLERS = {
         assertTodoistId(rest.parent_id, "parent_id");
       }
       const body = {};
-      if (rest.content)     body.content = rest.content;
+      // content/description use !== undefined so description:"" can CLEAR the
+      // field (a truthy check silently no-ops the clear). Todoist rejects
+      // empty content — that error surfaces to the caller instead of hiding.
+      if (rest.content !== undefined)     body.content = rest.content;
       if (rest.labels)      body.labels = rest.labels;
       if (rest.priority !== undefined) body.priority = rest.priority;
-      if (rest.description) body.description = rest.description;
+      if (rest.description !== undefined) body.description = rest.description;
       if (rest.project_id)  body.project_id = rest.project_id;
       if (rest.parent_id !== undefined) body.parent_id = (rest.parent_id === "" || rest.parent_id === "none") ? null : rest.parent_id;
       if (rest.due_date)    body.due_date = evalDate(rest.due_date);
@@ -709,8 +751,13 @@ const TOOL_HANDLERS = {
       if (completedPid) assertTodoistId(completedPid, "project_id");
       if (args.section_id) assertTodoistId(args.section_id, "section_id");
       const params = new URLSearchParams();
-      params.set("since", since + "T00:00:00Z");
-      params.set("until", until + "T23:59:59Z");
+      // since/until are JST calendar dates — convert JST midnight boundaries to
+      // UTC before sending. Appending "Z" directly shifted the whole window 9h
+      // late (JST 00:00–08:59 completions on the `since` day were dropped).
+      const jstToUtc = (date, time) =>
+        new Date(`${date}T${time}+09:00`).toISOString().replace(/\.\d{3}Z$/, "Z");
+      params.set("since", jstToUtc(since, "00:00:00"));
+      params.set("until", jstToUtc(until, "23:59:59"));
       // Schema advertises default 50 / max 200 — enforce both so callers
       // can't accidentally DoS themselves via an unbounded API call.
       const limit = Math.min(Math.max(1, args.limit ?? 50), 200);
@@ -745,6 +792,13 @@ const TOOL_HANDLERS = {
       // Collect reorder items from all update ops; executed as a single Sync API call after REST ops.
       const reorderItems = [];
 
+      // Sequential (#N) closes defer their renumber to AFTER all ops finish,
+      // deduplicated per (section, parent) group and run sequentially. Running
+      // handleItemCompleted inline per-close raced when two siblings closed in
+      // the same concurrency batch — both read stale state and issued
+      // conflicting renumbers.
+      const renumberTargets = new Map();
+
       // Execute a single operation, reusing existing handler logic
       const execOp = async (op, idx) => {
         try {
@@ -758,10 +812,11 @@ const TOOL_HANDLERS = {
                 assertTodoistId(op.parent_id, "parent_id");
               }
               const body = {};
-              if (op.content)     body.content = op.content;
+              // Mirrors t_update_task: !== undefined so "" can clear description.
+              if (op.content !== undefined)     body.content = op.content;
               if (op.labels)      body.labels = op.labels;
               if (op.priority !== undefined) body.priority = op.priority;
-              if (op.description) body.description = op.description;
+              if (op.description !== undefined) body.description = op.description;
               if (op.project_id)  body.project_id = op.project_id;
               if (op.parent_id !== undefined) body.parent_id = (op.parent_id === "" || op.parent_id === "none") ? null : op.parent_id;
               if (op.due_date)    body.due_date = evalDate(op.due_date);
@@ -784,10 +839,15 @@ const TOOL_HANDLERS = {
               await todoistReq(tt, "POST", `/tasks/${op.task_id}/close`);
               const res = { idx, action: "close", task_id: op.task_id, ok: true };
               if (task?.content && /^#\d+\s/.test(task.content) && task.section_id) {
-                res.renumber = await handleItemCompleted(
-                  { event_data: { content: task.content, section_id: task.section_id, parent_id: task.parent_id ?? null } },
-                  tt,
-                );
+                const key = `${task.section_id}:${task.parent_id ?? ""}`;
+                if (!renumberTargets.has(key)) {
+                  renumberTargets.set(key, {
+                    content: task.content,
+                    section_id: task.section_id,
+                    parent_id: task.parent_id ?? null,
+                  });
+                }
+                res.renumber = "deferred"; // see top-level `renumbers` in the result
               }
               return res;
             }
@@ -851,12 +911,25 @@ const TOOL_HANDLERS = {
         }
       }
 
+      // Renumber once per (section, parent) group, sequentially, now that all
+      // closes have landed — each pass reads fresh post-close state.
+      const renumbers = [];
+      for (const target of renumberTargets.values()) {
+        try {
+          const r = await handleItemCompleted({ event_data: target }, tt);
+          renumbers.push({ section_id: target.section_id, parent_id: target.parent_id, ...r });
+        } catch (e) {
+          renumbers.push({ section_id: target.section_id, parent_id: target.parent_id, ok: false, error: e.message });
+        }
+      }
+
       // Recompute after reorder-failure marking above
       const succeeded = results.filter(r => r.ok).length;
       const failed = results.filter(r => !r.ok).length;
       return {
         total: ops.length, succeeded, failed,
         ...(failed > 0 && { partial_failure: true }),
+        ...(renumbers.length && { renumbers }),
         results,
       };
   },
@@ -944,7 +1017,10 @@ const TOOL_HANDLERS = {
       if (!jobs.length) return { error: "No context sources configured. Set CONTEXT_CONFIG, TODOIST_CONFIG.inbox_project_id, or NOTION_DB_IDS.habits_page, or pass args." };
       // JST-resolved date anchors so callers never hand-compute a date or
       // round-trip to eval_date for the common cases. Cheap (pure compute).
-      out.dates = {
+      // A user-configured source labeled "dates" keeps its slot; the anchors
+      // move to `_dates` instead of clobbering it.
+      const datesKey = out.dates === undefined ? "dates" : "_dates";
+      out[datesKey] = {
         today: evalDate("today"),
         now: evalDate("now"),
         yesterday: evalDate("yesterday"),
@@ -1352,9 +1428,23 @@ async function runBulkMetrics(args, { env, nt }) {
     // API) and Japanese keys (the original API; some clients/conversations
     // still use these). ASCII wins if both are present.
     const rawMetric = e.metric ?? e["指標"];
-    const value = e.value ?? e["値"];
+    const rawValue = e.value ?? e["値"];
     const unit = e.unit ?? e["単位"];
     const memo = e.memo ?? e["メモ"];
+    // Validate per-entry (quick_log already does; this path previously wrote a
+    // value-less row when `value` was missing). Costs 0 subrequests. Coerce via
+    // Number() — some MCP clients serialize schema-declared numbers as strings
+    // (the n_metrics_series tail:N lesson) — but reject empty/NaN.
+    if (typeof rawMetric !== "string" || !rawMetric) {
+      results.push({ index: i, status: "error", ok: false, error: "metric is required (string)" });
+      continue;
+    }
+    const value = (rawValue === undefined || rawValue === null || rawValue === "")
+      ? NaN : Number(rawValue);
+    if (!Number.isFinite(value)) {
+      results.push({ index: i, status: "error", ok: false, error: "value is required (number)", metric: rawMetric });
+      continue;
+    }
     const metric = normalizeMetricName(rawMetric, aliases);
     const title = `${iso}_${metric}`;
 
@@ -1620,7 +1710,7 @@ export async function handleMCP(request, url, env) {
         result = {
           protocolVersion: MCP_VERSION,
           capabilities: { tools: {} },
-          serverInfo: { name: "notion-todoist-mcp", version: "1.8.0" },
+          serverInfo: { name: "notion-todoist-mcp", version: "1.9.0" },
         };
         break;
 

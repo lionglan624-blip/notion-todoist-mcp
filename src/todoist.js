@@ -47,7 +47,16 @@ export function compactProject(p) {
 
 export function toTSV(rows) {
   if (!rows.length) return "";
-  const keys = Object.keys(rows[0]);
+  // Union of keys across ALL rows (in first-seen order) — keying off rows[0]
+  // alone silently drops columns that only later rows carry (e.g. per-row
+  // `normalized_from` / `error` in bulk results).
+  const keys = [];
+  const seen = new Set();
+  for (const r of rows) {
+    for (const k of Object.keys(r)) {
+      if (!seen.has(k)) { seen.add(k); keys.push(k); }
+    }
+  }
   const escape = (v) => {
     if (v === null || v === undefined) return "";
     if (Array.isArray(v)) return v.join(",");
@@ -73,13 +82,20 @@ export function formatTodoistList(items, compactFn, args) {
 // ─────────────────────────────────────────────
 // Todoist API helper  (429対応: Retry-After尊重 + 指数バックオフ)
 // ─────────────────────────────────────────────
-export async function todoistReq(token, method, path, body, _attempt = 0) {
+export async function todoistReq(token, method, path, body, _attempt = 0, _reqId) {
+  // Stable per-logical-request ID, reused across retries. Todoist deduplicates
+  // writes carrying the same X-Request-Id, which makes the 5xx retry below safe
+  // even for non-idempotent ops like create (a 5xx after server-side success
+  // would otherwise duplicate the task on retry).
+  const reqId = _reqId ?? crypto.randomUUID();
+  const headers = {
+    Authorization: `Bearer ${token}`,
+    "Content-Type": "application/json",
+  };
+  if (method !== "GET") headers["X-Request-Id"] = reqId;
   const res = await fetch(`https://api.todoist.com/api/v1${path}`, {
     method,
-    headers: {
-      Authorization: `Bearer ${token}`,
-      "Content-Type": "application/json",
-    },
+    headers,
     body: body ? JSON.stringify(body) : undefined,
   });
 
@@ -91,15 +107,14 @@ export async function todoistReq(token, method, path, body, _attempt = 0) {
     const headerMs = Number.isFinite(retryAfter) ? retryAfter * 1000 : 0;
     const waitMs = Math.max(headerMs, 400 * Math.pow(2, _attempt));
     await sleep(waitMs);
-    return todoistReq(token, method, path, body, _attempt + 1);
+    return todoistReq(token, method, path, body, _attempt + 1, reqId);
   }
 
-  // Server error — wait 500ms and retry once.
-  // Write ops (POST/DELETE) are idempotent by task_id for update/close/delete/reopen.
-  // For create, caller handles dedup (see t_create_task / t_bulk).
+  // Server error — wait 500ms and retry once. Safe for create too because the
+  // retry reuses the same X-Request-Id (see above).
   if (res.status >= 500 && _attempt < 1) {
     await sleep(500);
-    return todoistReq(token, method, path, body, _attempt + 1);
+    return todoistReq(token, method, path, body, _attempt + 1, reqId);
   }
 
   if (!res.ok) {

@@ -8,7 +8,7 @@ A custom [MCP (Model Context Protocol)](https://modelcontextprotocol.io/) server
 
 | Tool | Description |
 |------|-------------|
-| `t_get_tasks` | Query tasks by project, section (name), section_id, label, filter, or IDs. `project_id:"all"` for cross-project. Compact TSV output by default |
+| `t_get_tasks` | Query tasks by project, section (name), section_id, label, filter, or IDs. `project_id:"all"` for cross-project. Auto-paginates unless `limit` is set. Compact TSV output by default |
 | `t_get_task` | Get a single task by ID |
 | `t_create_task` | Create a task with labels, due date, priority, section, subtask support |
 | `t_update_task` | Update any task field including move between projects/sections and reorder within a section |
@@ -37,7 +37,7 @@ A custom [MCP (Model Context Protocol)](https://modelcontextprotocol.io/) server
 | `n_metrics_series` | Trend-read sugar over the Metrics DB: one call returns `{series:[{date,値,…}], stats:{first,last,delta,min,max,avg,median,count}}` for a single `metric` with optional `from`/`to` date bounds. Always sorted ascending; `limit:N` keeps the oldest N, `tail:N` keeps the latest N (use `tail` for "most recent N for trend display"). When `METRIC_RANGES` env var defines a reference range for the metric, also returns `ref:{low,high}` + `last_flag:"high"/"low"/"normal"` against the final entry. Replaces the n_query→filter→sorts→stats boilerplate |
 | `quick_log` | One-shot single-metric log into the Metrics DB (`{metric, value, unit?, memo?, date?, mode?}`). Sugar over `n_bulk_metrics` for a single reading; defaults `date:"today"` + `mode:"upsert"` (idempotent re-logging). For daily one-liners (resting HR, weight, RPE) |
 | `n_get_page` | Get a single page with all properties |
-| `n_get_blocks` | Get page body as plain text with heading markers (`##`/`###`/`####`) |
+| `n_get_blocks` | Get page body as plain text with heading markers (`##`/`###`/`####`). Pages >100 blocks: pass the returned `next_cursor` back as `start_cursor` |
 | `n_get_schema` | Get database property schema |
 | `n_search` | Search workspace by title, or set `search_body:true` for bounded full-text body scan (fetches blocks for up to `max_scan` accessible pages, default 50, cap 100). `query` optional for title path. `include_properties:true` adds compact properties for client-side filtering |
 | `n_create_database` | Create a new database under a parent page |

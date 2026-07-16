@@ -30,8 +30,14 @@ export function evalDate(expr) {
     const d = new Date(todayJST);
     if (unit === "d") d.setUTCDate(d.getUTCDate() + n);
     if (unit === "w") d.setUTCDate(d.getUTCDate() + n * 7);
-    if (unit === "m") d.setUTCMonth(d.getUTCMonth() + n);
-    if (unit === "y") d.setUTCFullYear(d.getUTCFullYear() + n);
+    if (unit === "m" || unit === "y") {
+      // Clamp month/year arithmetic to the end of the target month instead of
+      // letting JS roll over (Jan 31 + 1m would otherwise become Mar 3).
+      const day = d.getUTCDate();
+      if (unit === "m") d.setUTCMonth(d.getUTCMonth() + n);
+      else d.setUTCFullYear(d.getUTCFullYear() + n);
+      if (d.getUTCDate() !== day) d.setUTCDate(0);
+    }
     return isoDate(d);
   }
 
@@ -56,14 +62,19 @@ export function evalDate(expr) {
   return expr; // ISO date/datetime pass-through
 }
 
-// Recursively resolve date expressions inside a Notion filter object
+// Recursively resolve date expressions inside a Notion filter object.
+// Covers property date filters ({property, date:{...}}) AND timestamp filters
+// ({timestamp:"created_time", created_time:{...}} / last_edited_time) — the
+// condition object key differs but the operator shape is identical.
+const DATE_FILTER_KEYS = new Set(["date", "created_time", "last_edited_time"]);
+
 export function resolveFilterDates(filter) {
   if (!filter || typeof filter !== "object") return filter;
   if (Array.isArray(filter)) return filter.map(resolveFilterDates);
 
   const out = {};
   for (const [k, v] of Object.entries(filter)) {
-    if (k === "date" && typeof v === "object" && v !== null) {
+    if (DATE_FILTER_KEYS.has(k) && typeof v === "object" && v !== null) {
       out[k] = {};
       for (const [op, val] of Object.entries(v)) {
         const dateOps = ["equals","before","after","on_or_before","on_or_after"];

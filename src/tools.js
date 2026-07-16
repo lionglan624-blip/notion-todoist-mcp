@@ -10,6 +10,7 @@ export const TOOLS = [
       "Pass project_id:\"all\" to fetch tasks across every project (no project filter). " +
       "Filter by section (name), section_id, label, filter, or ids[]. " +
       "section: resolve by name (e.g. 'ワクチン接種'). " +
+      "Auto-paginates the Todoist cursor (up to 20 pages) unless limit is set. " +
       "compact (default true) returns id/section/co/content/labels/due. " +
       "Default format: tsv. fields: id,section,sid,co(=child_order/section position),content,labels,due,pid,pri,desc,proj,rec,cat.",
     inputSchema: {
@@ -92,7 +93,9 @@ export const TOOLS = [
       "Execute multiple Todoist operations in one call. " +
       "Actions: update (task_id + fields), close (task_id), delete (task_id), " +
       "create (content + fields). Runs in parallel (max 3 concurrent). " +
-      "Use for /review label fixes, batch closes, or sequential task renumbering.",
+      "Use for /review label fixes, batch closes, or sequential task renumbering. " +
+      "Closing sequential (#N) tasks defers renumbering until all ops finish — one pass per (section, parent), " +
+      "reported in top-level `renumbers` (per-op renumber shows \"deferred\").",
     inputSchema: {
       type: "object",
       properties: {
@@ -155,7 +158,7 @@ export const TOOLS = [
     description:
       "Query a Notion database. Accepts collection:// IDs. compact:true (default) compresses output. fetch_all:true auto-paginates (max 500). " +
       "Date expressions supported in filters: today, today+7d, today-30d, etc. " +
-      "Optional aggregate: {count, sum, avg, min, max} by property name. " +
+      "Optional aggregate: {count, sum, avg, min, max} by property name — aggregates read the full property set, so they work even when fields excludes the aggregated property. " +
       "fields: restrict returned properties to listed names (e.g. [\"ドメイン\"] for index-only fetch).",
     inputSchema: {
       type: "object",
@@ -209,7 +212,8 @@ export const TOOLS = [
       "Update properties or body content of a Notion page. " +
       "archived:true moves the page to trash (deletion); archived:false restores. " +
       "For a deletion-only call, prefer n_delete_page — this is the same archive op wrapped for clarity. " +
-      "replace_content: Markdown string to replace the entire page body. " +
+      "replace_content: Markdown string to replace the entire page body — deletes old blocks one-by-one and is subrequest-budget capped; " +
+      "if the budget is hit the response carries stale_blocks + warning (prefer n_delete_page + n_create_page for large pages). " +
       "append_content: Markdown string to append blocks at the end of the page. " +
       "Property shorthand: string→rich_text, number→number, bool→checkbox, " +
       "[\"a\",\"b\"]→multi_select, {title:\"s\"}, {select:\"s\"}, {date:\"expr\"}, {multi_select:[\"a\"]}.",
@@ -405,7 +409,7 @@ export const TOOLS = [
   // ── Utility ───────────────────────────────
   {
     name: "eval_date",
-    description: "Resolve a JST date expression to ISO date. Arg name is `expression` (alias `expr` also accepted). Supports: today, yesterday, tomorrow, today+7d, today-30d, today+2w, today+1m, today+1y, now, week_start/week_end (Mon–Sun of this week), month_start/month_end.",
+    description: "Resolve a JST date expression to ISO date. Arg name is `expression` (alias `expr` also accepted). Supports: today, yesterday, tomorrow, today+7d, today-30d, today+2w, today+1m, today+1y, now, week_start/week_end (Mon–Sun of this week), month_start/month_end. Month/year arithmetic clamps to the target month's end (Jan 31 +1m → Feb 28, not Mar 3).",
     inputSchema: {
       type: "object",
       properties: {
@@ -449,12 +453,15 @@ export const TOOLS = [
   },
   {
     name: "n_get_blocks",
-    description: "Get page body as plain text blocks. Use when you need page content, not just properties.",
+    description:
+      "Get page body as plain text blocks. Use when you need page content, not just properties. " +
+      "Pages >100 blocks: the response includes next_cursor — pass it back as start_cursor to read the next page.",
     inputSchema: {
       type: "object",
       properties: {
         page_id: { type: "string" },
         page_size: { type: "number", default: 100 },
+        start_cursor: { type: "string", description: "Continue from a prior call's next_cursor" },
       },
       required: ["page_id"],
     },
