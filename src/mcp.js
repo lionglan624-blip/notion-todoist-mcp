@@ -78,14 +78,16 @@ const TOOL_HANDLERS = {
       : sorted[mid];
     const r = args.round ?? null;
     const fmt = (n) => r !== null ? Math.round(n * 10 ** r) / 10 ** r : n;
+    // fmt applies to every numeric output — the description promises "round
+    // all results", and half-rounded output contradicted it.
     return {
       count: nums.length,
       sum: fmt(sum),
       avg: fmt(avg),
-      min: sorted[0],
-      max: sorted[sorted.length - 1],
-      first: nums[0],
-      last: nums[nums.length - 1],
+      min: fmt(sorted[0]),
+      max: fmt(sorted[sorted.length - 1]),
+      first: fmt(nums[0]),
+      last: fmt(nums[nums.length - 1]),
       delta: fmt(nums[nums.length - 1] - nums[0]),
       median: fmt(median),
     };
@@ -220,9 +222,17 @@ const TOOL_HANDLERS = {
           if (op === "last")  out.aggregations[`last_${prop}`]  = nums[nums.length - 1];
           if (op === "delta") out.aggregations[`delta_${prop}`] = nums[nums.length - 1] - nums[0];
         }
-        // only_agg:true → aggregations only (skip results to save tokens)
+        // only_agg:true → aggregations only (skip results to save tokens).
+        // Keep warnings + pagination signals — dropping them hid exactly the
+        // silent-failure cases they exist for (typo'd property → empty
+        // aggregations with no hint; truncated fetch → stats over a slice).
         if (agg.only_agg) {
-          return { result_count: pages.length, aggregations: out.aggregations };
+          return {
+            result_count: pages.length,
+            aggregations: out.aggregations,
+            ...(out.warnings && { warnings: out.warnings, available_fields: out.available_fields }),
+            ...(out.has_more && { has_more: out.has_more, next_cursor: out.next_cursor }),
+          };
         }
       }
       return out;
@@ -241,7 +251,10 @@ const TOOL_HANDLERS = {
       const params = new URLSearchParams({ page_size: String(pageSize) });
       if (args.start_cursor) params.set("start_cursor", String(args.start_cursor));
       const res = await notionReq(nt, "GET", `/blocks/${id}/children?${params}`);
-      const extractText = (richTexts) => (richTexts || []).map(t => t.plain_text).join("");
+      // child_page / child_database blocks carry `title` as a plain STRING,
+      // not a rich_text array — .map on it crashed the whole call for any
+      // page containing a sub-page.
+      const extractText = (rt) => typeof rt === "string" ? rt : (rt || []).map(t => t.plain_text).join("");
       const blocks = res.results.map(b => {
         const type = b.type;
         const content = b[type];
@@ -317,6 +330,12 @@ const TOOL_HANDLERS = {
       // with "Too many subrequests" instead of returning a warning.
       const budget = Math.max(1, Number(env.SUBREQUEST_BUDGET) || 50);
       let spent = 0;
+      // append_content's cost is computed UP FRONT and reserved as headroom in
+      // the delete loop below — otherwise a large append after a budget-capped
+      // replace_content could still blow the invocation cap (dying after the
+      // appends, so the caller never sees the stale_blocks warning).
+      const appendBlocks = args.append_content ? mdToBlocks(args.append_content) : [];
+      const appendCost = Math.ceil(appendBlocks.length / NOTION_CHILDREN_BATCH);
       // 1. Property / archived update
       if (args.properties || args.archived !== undefined) {
         const body = {};
@@ -334,6 +353,12 @@ const TOOL_HANDLERS = {
         const oldBlocks = [];
         let cursor;
         do {
+          // Bail out with a clear error instead of letting a huge page's
+          // snapshot GETs blow the platform cap mid-loop (raw "Too many
+          // subrequests" with no stale_blocks warning).
+          if (spent >= budget - 2 - appendCost) {
+            throw new Error(`page too large for replace_content under subrequest budget (${budget}); use n_delete_page + n_create_page instead`);
+          }
           const qs = cursor ? `?page_size=100&start_cursor=${cursor}` : `?page_size=100`;
           const page = await notionReq(nt, "GET", `/blocks/${pid}/children${qs}`);
           spent += 1;
@@ -348,28 +373,28 @@ const TOOL_HANDLERS = {
         }
         // Only delete old blocks after new content is safely in place.
         // Track deletion failures so the caller knows the page has stale blocks.
-        // Keep 3 subrequests of headroom (possible append_content + final GET).
+        // Headroom = the pending append_content chunks + the final GET.
         const deleteFailures = [];
         for (const blk of oldBlocks) {
-          if (spent >= budget - 3) { staleBlocks++; continue; }
+          if (spent >= budget - 1 - appendCost) { staleBlocks++; continue; }
           try {
             await notionReq(nt, "DELETE", `/blocks/${blk.id}`);
-            spent += 1;
           } catch (e) {
             deleteFailures.push({ id: blk.id, error: e.message });
           }
+          // A failed DELETE still consumed a real subrequest (plus retries) —
+          // count it either way so the guard tracks actual usage.
+          spent += 1;
         }
         if (deleteFailures.length) {
           // Non-fatal: surface as a warning so the caller can clean up.
           replaceWarnings = deleteFailures;
         }
       }
-      // 3. append_content: append blocks after existing content
-      if (args.append_content) {
-        const appendBlocks = mdToBlocks(args.append_content);
-        if (appendBlocks.length) {
-          await appendBlocksChunked(nt, pid, appendBlocks);
-        }
+      // 3. append_content: append blocks after existing content (cost reserved above)
+      if (appendBlocks.length) {
+        await appendBlocksChunked(nt, pid, appendBlocks);
+        spent += appendCost;
       }
       const p = await notionReq(nt, "GET", `/pages/${pid}`);
       const out = { id: p.id, url: p.url, last_edited_time: p.last_edited_time };
@@ -441,7 +466,7 @@ const TOOL_HANDLERS = {
 
   n_metrics_series: async (args, ctx) => runMetricsSeries(args, ctx),
 
-  n_search: async (args, { nt }) => {
+  n_search: async (args, { env, nt }) => {
       // Page title lives under whichever property is typed "title" — the key
       // is not always "title" (often "Name" or a localized label), so scan.
       const extractPageTitle = (props) => {
@@ -461,7 +486,12 @@ const TOOL_HANDLERS = {
       // hard cap 100) to avoid runaway API cost.
       if (args.search_body && args.query) {
         const needle = String(args.query).toLowerCase();
-        const maxScan = Math.min(Math.max(1, args.max_scan ?? 50), 100);
+        // Cap the fan-out below the per-invocation subrequest budget (1 for
+        // the search POST + headroom) — the default max_scan of 50 plus the
+        // search itself exceeded the free-tier cap of 50, and the resulting
+        // "Too many subrequests" was swallowed as a false "no match".
+        const budget = Math.max(1, Number(env.SUBREQUEST_BUDGET) || 50);
+        const maxScan = Math.min(Math.max(1, args.max_scan ?? 50), 100, budget - 3);
         const listBody = { query: "", page_size: maxScan, filter: { value: "page", property: "object" } };
         const listed = await notionReq(nt, "POST", "/search", listBody);
 
@@ -472,6 +502,7 @@ const TOOL_HANDLERS = {
             const bodyText = blocks.results.map(b => {
               const c = b[b.type];
               if (c?.rich_text) return c.rich_text.map(t => t.plain_text).join("");
+              if (typeof c?.title === "string") return c.title; // child_page/child_database
               if (c?.title)     return c.title.map(t => t.plain_text).join("");
               return "";
             }).join("\n");
@@ -479,10 +510,14 @@ const TOOL_HANDLERS = {
             const combined = (title + "\n" + bodyText).toLowerCase();
             return combined.includes(needle) ? { r, title, snippet: bodyText.slice(0, 240) } : null;
           } catch {
+            // Surface as a count instead of silently treating an unreadable
+            // page as a non-match (a swallowed error is a wrong answer here).
+            scanErrors++;
             return null;
           }
         };
 
+        let scanErrors = 0;
         const hits = [];
         for (let i = 0; i < listed.results.length && hits.length < pageSize; i += 3) {
           const batch = listed.results.slice(i, i + 3);
@@ -493,6 +528,7 @@ const TOOL_HANDLERS = {
         return {
           scanned: listed.results.length,
           scan_has_more: listed.has_more,
+          ...(scanErrors > 0 && { scan_errors: scanErrors, scan_errors_note: "some pages could not be read and were not matched" }),
           match_count: hits.length,
           results: hits.slice(0, pageSize).map(({ r, title, snippet }) => {
             const row = {
@@ -695,22 +731,41 @@ const TOOL_HANDLERS = {
         assertTodoistId(rest.parent_id, "parent_id");
       }
       const body = {};
-      // content/description use !== undefined so description:"" can CLEAR the
-      // field (a truthy check silently no-ops the clear). Todoist rejects
-      // empty content — that error surfaces to the caller instead of hiding.
-      if (rest.content !== undefined)     body.content = rest.content;
+      // content/description forward any STRING (so description:"" can CLEAR
+      // the field — a truthy check silently no-oped the clear) but drop
+      // null/undefined, which some MCP clients emit for omitted optionals and
+      // Todoist would 400 on. Todoist rejects empty content — that error
+      // surfaces to the caller instead of hiding.
+      if (typeof rest.content === "string")     body.content = rest.content;
       if (rest.labels)      body.labels = rest.labels;
-      if (rest.priority !== undefined) body.priority = rest.priority;
-      if (rest.description !== undefined) body.description = rest.description;
-      if (rest.project_id)  body.project_id = rest.project_id;
-      if (rest.parent_id !== undefined) body.parent_id = (rest.parent_id === "" || rest.parent_id === "none") ? null : rest.parent_id;
+      if (rest.priority !== undefined && rest.priority !== null) body.priority = rest.priority;
+      if (typeof rest.description === "string") body.description = rest.description;
       if (rest.due_date)    body.due_date = evalDate(rest.due_date);
       if (rest.due_string)  body.due_string = rest.due_string;
       if (Object.keys(body).length > 0) {
         await todoistReq(tt, "POST", `/tasks/${task_id}`, body);
       }
-      if (rest.section_id) {
-        await todoistSync(tt, [{ type: "item_move", uuid: crypto.randomUUID(), args: { id: task_id, section_id: rest.section_id } }]);
+      // ALL moves go through Sync item_move — the REST update endpoint
+      // rejects section_id (long-standing gotcha) and silently ignores
+      // project_id / parent_id in the body. item_move takes exactly ONE of
+      // parent_id / section_id / project_id per command.
+      const moves = [];
+      if (rest.project_id) moves.push({ project_id: rest.project_id });
+      if (rest.section_id) moves.push({ section_id: rest.section_id });
+      if (rest.parent_id !== undefined) {
+        if (rest.parent_id === "" || rest.parent_id === "none") {
+          // Promote to top level: a project/section move above already
+          // detaches; otherwise move to the current section / project root.
+          if (!moves.length) {
+            const cur = await todoistReq(tt, "GET", `/tasks/${task_id}`);
+            moves.push(cur?.section_id ? { section_id: cur.section_id } : { project_id: cur?.project_id });
+          }
+        } else {
+          moves.push({ parent_id: rest.parent_id });
+        }
+      }
+      for (const mv of moves) {
+        await todoistSync(tt, [{ type: "item_move", uuid: crypto.randomUUID(), args: { id: task_id, ...mv } }]);
       }
       return { success: true, task_id };
   },
@@ -762,10 +817,23 @@ const TOOL_HANDLERS = {
       // can't accidentally DoS themselves via an unbounded API call.
       const limit = Math.min(Math.max(1, args.limit ?? 50), 200);
       params.set("limit", String(limit));
-      const qs = params.toString();
-      const data = await todoistReq(tt, "GET", `/tasks/completed/by_completion_date?${qs}`);
-      let items = Array.isArray(data) ? data : (data?.items ?? data?.results ?? []);
-      // Worker-side filtering (API does not support these server-side)
+      // Filter server-side too — filtering Worker-side AFTER the API limit
+      // silently undercounted (50 most-recent overall could contain only a
+      // few Inbox rows while more existed past the limit).
+      if (completedPid) params.set("project_id", completedPid);
+      if (args.section_id) params.set("section_id", args.section_id);
+      // Cursor-paginate until the limit is filled (20-page safety cap).
+      let items = [];
+      let cursor = null;
+      for (let page = 0; page < 20 && items.length < limit; page++) {
+        if (cursor) params.set("cursor", cursor);
+        const data = await todoistReq(tt, "GET", `/tasks/completed/by_completion_date?${params}`);
+        items.push(...(Array.isArray(data) ? data : (data?.items ?? data?.results ?? [])));
+        cursor = data?.next_cursor ?? null;
+        if (!cursor) break;
+      }
+      items = items.slice(0, limit);
+      // Belt-and-braces re-filter in case the API ignores the params.
       if (args.section_id) items = items.filter(t => t.section_id === args.section_id);
       if (completedPid) items = items.filter(t => t.project_id === completedPid);
       // Default fields for completed tasks include completed_at + section name
@@ -812,24 +880,39 @@ const TOOL_HANDLERS = {
                 assertTodoistId(op.parent_id, "parent_id");
               }
               const body = {};
-              // Mirrors t_update_task: !== undefined so "" can clear description.
-              if (op.content !== undefined)     body.content = op.content;
+              // Mirrors t_update_task: strings only (so "" can clear
+              // description; null/undefined are dropped, not forwarded).
+              if (typeof op.content === "string")     body.content = op.content;
               if (op.labels)      body.labels = op.labels;
-              if (op.priority !== undefined) body.priority = op.priority;
-              if (op.description !== undefined) body.description = op.description;
-              if (op.project_id)  body.project_id = op.project_id;
-              if (op.parent_id !== undefined) body.parent_id = (op.parent_id === "" || op.parent_id === "none") ? null : op.parent_id;
+              if (op.priority !== undefined && op.priority !== null) body.priority = op.priority;
+              if (typeof op.description === "string") body.description = op.description;
               if (op.due_date)    body.due_date = evalDate(op.due_date);
               if (op.due_string)  body.due_string = op.due_string;
-              // order is handled via Sync API after all REST ops complete
-              if (op.order !== undefined) reorderItems.push({ id: op.task_id, child_order: op.order });
               // Only call REST if there are non-order fields to update
               if (Object.keys(body).length > 0) {
                 await todoistReq(tt, "POST", `/tasks/${op.task_id}`, body);
               }
-              if (op.section_id) {
-                await todoistSync(tt, [{ type: "item_move", uuid: crypto.randomUUID(), args: { id: op.task_id, section_id: op.section_id } }]);
+              // Moves via Sync item_move (mirrors t_update_task — REST body
+              // rejects section_id and ignores project_id/parent_id).
+              const moves = [];
+              if (op.project_id) moves.push({ project_id: op.project_id });
+              if (op.section_id) moves.push({ section_id: op.section_id });
+              if (op.parent_id !== undefined) {
+                if (op.parent_id === "" || op.parent_id === "none") {
+                  if (!moves.length) {
+                    const cur = await todoistReq(tt, "GET", `/tasks/${op.task_id}`);
+                    moves.push(cur?.section_id ? { section_id: cur.section_id } : { project_id: cur?.project_id });
+                  }
+                } else {
+                  moves.push({ parent_id: op.parent_id });
+                }
               }
+              for (const mv of moves) {
+                await todoistSync(tt, [{ type: "item_move", uuid: crypto.randomUUID(), args: { id: op.task_id, ...mv } }]);
+              }
+              // order is queued only after everything above succeeded — a
+              // failed update op previously still got its reorder applied.
+              if (op.order !== undefined) reorderItems.push({ id: op.task_id, child_order: op.order });
               return { idx, action: "update", task_id: op.task_id, ok: true };
             }
             case "close": {
@@ -961,7 +1044,8 @@ const TOOL_HANDLERS = {
 
       const queriesCfg = args.queries ?? envCfg.queries ?? [];
 
-      const extractBlockText = (rt) => (rt || []).map(t => t.plain_text).join("");
+      // `title` is a plain string on child_page/child_database blocks.
+      const extractBlockText = (rt) => typeof rt === "string" ? rt : (rt || []).map(t => t.plain_text).join("");
       const blocksToMarkdown = (blocks) => blocks.map(b => {
         const c = b[b.type];
         let text = "";
@@ -978,9 +1062,18 @@ const TOOL_HANDLERS = {
         const pid = cfg.project_id;
         if (!pid) return null;
         const { map: sectionMap } = await buildSectionMap(tt, pid);
-        const params = new URLSearchParams({ project_id: pid });
-        const raw = await todoistReq(tt, "GET", `/tasks?${params}`);
-        const items = Array.isArray(raw) ? raw : (raw?.results ?? []);
+        // Cursor-paginate like t_get_tasks / the cron — a single GET truncated
+        // large projects to the first API page.
+        const items = [];
+        let cursor = null;
+        for (let page = 0; page < 20; page++) {
+          const params = new URLSearchParams({ project_id: pid });
+          if (cursor) params.set("cursor", cursor);
+          const raw = await todoistReq(tt, "GET", `/tasks?${params}`);
+          items.push(...(Array.isArray(raw) ? raw : (raw?.results ?? [])));
+          cursor = raw?.next_cursor ?? null;
+          if (!cursor) break;
+        }
         return toTSV(items.map(t => compactTask(t, cfg.fields || TASK_COMPACT_DEFAULTS, sectionMap)));
       };
 
@@ -1205,6 +1298,11 @@ async function execNotionOp(op, idx, nt, budget, spentBefore) {
           const oldBlocks = [];
           let cursor;
           do {
+            // Same bail-out as n_update_page: fail with a clear error before
+            // the snapshot alone exhausts the invocation's subrequest cap.
+            if (spentBefore + cost >= budget - 1) {
+              throw new Error(`page too large for replace_content under subrequest budget (${budget}); use delete + create ops instead`);
+            }
             const qs = cursor ? `?page_size=100&start_cursor=${cursor}` : `?page_size=100`;
             const page = await notionReq(nt, "GET", `/blocks/${pid}/children${qs}`);
             cost += 1;
@@ -1241,7 +1339,10 @@ async function execNotionOp(op, idx, nt, budget, spentBefore) {
         throw new Error(`Unknown op: ${op.op}`);
     }
   } catch (e) {
-    return { index: idx, op: op.op, ok: false, error: e.message, __cost: 1 };
+    // No __cost on error — the caller falls back to the op's ESTIMATE, which
+    // is closer to actual usage than a flat 1 (an update_block whose PATCH
+    // failed still spent its GET; undercounting could overrun the real cap).
+    return { index: idx, op: op.op, ok: false, error: e.message };
   }
 }
 
@@ -1672,11 +1773,14 @@ export async function handleMCP(request, url, env) {
   const authHeader = request.headers.get("Authorization") ?? "";
   const token = authHeader.replace(/^Bearer\s+/i, "");
   const verified = token ? await verifyToken(token, "access", env).catch(() => null) : null;
-  // RFC 8707: if the access token was bound to a specific resource, enforce it.
+  // RFC 8707: enforce the token's resource binding — fail CLOSED on a missing
+  // aud. Every live mint path sets aud (and pre-aud access tokens expired
+  // within 1h of the rollout), so an aud-less token is either forged-adjacent
+  // or ancient; rejecting it costs nothing and removes the fail-open gap.
   // Accept both `${origin}/mcp` and `${origin}` as the canonical resource identifier.
-  if (verified?.aud) {
+  if (verified) {
     const expected = [`${url.origin}/mcp`, url.origin];
-    if (!expected.includes(verified.aud)) {
+    if (!verified.aud || !expected.includes(verified.aud)) {
       return new Response(JSON.stringify({ error: "invalid_token" }), {
         status: 401,
         headers: {
@@ -1710,7 +1814,7 @@ export async function handleMCP(request, url, env) {
         result = {
           protocolVersion: MCP_VERSION,
           capabilities: { tools: {} },
-          serverInfo: { name: "notion-todoist-mcp", version: "1.9.0" },
+          serverInfo: { name: "notion-todoist-mcp", version: "1.9.1" },
         };
         break;
 

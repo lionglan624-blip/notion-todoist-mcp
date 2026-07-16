@@ -31,7 +31,9 @@ export const TOOLS = [
   },
   {
     name: "t_update_task",
-    description: "Update a Todoist task. due_date supports date expressions (today, today+7d, etc.).",
+    description:
+      "Update a Todoist task. due_date supports date expressions (today, today+7d, etc.). " +
+      "Moves (project_id / section_id / parent_id) are executed via Sync item_move — parent_id:'none' promotes to top-level (best-effort: moves to the current section/project root).",
     inputSchema: {
       type: "object",
       properties: {
@@ -298,6 +300,7 @@ export const TOOLS = [
               append_content: { type: "string", description: "Markdown appended after existing blocks (update)" },
               replace_content: { type: "string", description: "Markdown replacing the whole body (update) — prefer delete+create" },
               archived: { type: "boolean", description: "true trashes the page (update) or deletes the block (update_block)" },
+              delete: { type: "boolean", description: "Alias of archived:true (update_block only)" },
             },
           },
         },
@@ -479,7 +482,8 @@ export const TOOLS = [
     name: "n_search",
     description:
       "Search Notion workspace. Default path uses Notion's /search API (title-only — body/property text is NOT indexed). " +
-      "search_body:true enables body-text scan: fans out up to max_scan accessible pages (default 50, max 100), fetches each page's blocks, and filters by substring match against title+body. Expensive; use with a non-empty query. " +
+      "search_body:true enables body-text scan: fans out up to max_scan accessible pages (default 50, max 100), fetches each page's blocks, and filters by substring match against title+body. " +
+      "Each page is matched against its FIRST 100 blocks only — a term that appears only deeper in a long page is missed. Scans pages only (`type` is ignored on this path); max_scan is also capped by the subrequest budget. Expensive; use with a non-empty query. " +
       "query is optional for the default path — omit (or pass empty string) with type:\"database\" to list all databases the integration can access, " +
       "or with type:\"page\" to list all accessible top-level pages (useful for finding a parent_page_id before n_create_database). " +
       "include_properties:true returns compact properties for each page result so the caller can filter client-side.",
@@ -523,7 +527,7 @@ export const TOOLS = [
     name: "t_get_completed_tasks",
     description:
       "Get completed Todoist tasks. Defaults to the last 7 days, Inbox project. " +
-      "section_id / project_id are filtered Worker-side (not by Todoist API). " +
+      "section_id / project_id are passed to the API server-side (and re-filtered Worker-side as a safety net); cursor-paginates until `limit` is filled. " +
       "Use for /review step 3: checking which #1 tasks finished so next can be promoted. " +
       "compact:true (default) strips fields. format:'tsv' for token savings.",
     inputSchema: {

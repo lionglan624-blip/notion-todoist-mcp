@@ -61,9 +61,10 @@ export function toTSV(rows) {
     if (v === null || v === undefined) return "";
     if (Array.isArray(v)) return v.join(",");
     const s = String(v);
-    // If value contains tab or newline, quote it (replace internal newlines with ␊)
+    // Replace field-breaking characters: newlines → ␊, tabs → ␉. A literal
+    // tab inside a value shifted every subsequent column in the row.
     if (s.includes("\t") || s.includes("\n") || s.includes("\r"))
-      return s.replace(/[\r\n]+/g, "␊");
+      return s.replace(/[\r\n]+/g, "␊").replace(/\t/g, "␉");
     return s;
   };
   const header = keys.join("\t");
